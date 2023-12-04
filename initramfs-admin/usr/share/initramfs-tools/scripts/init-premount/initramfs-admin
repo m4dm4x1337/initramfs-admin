@@ -2422,7 +2422,7 @@ do_nano_start() {
 
   do_clear_screen
 
-  nano
+  nano --mouse
 }
 
 do_htop_start() {
@@ -2562,7 +2562,7 @@ do_sshd_change_listening_port() {
 }
 
 do_sshd_edit_authorized_keys() {
-  nano "$HOME/.ssh/authorized_keys"
+  nano --mouse "$HOME/.ssh/authorized_keys"
 }
 
 do_render_sshd_status() {
@@ -2645,7 +2645,7 @@ do_render_network_manager() {
       6) do_interface_down   wlan ;;
       7) do_interface_config wlan ;;
       8) do_interface_status wlan ;;
-    R|r) nano /etc/resolv.conf ;;
+    R|r) nano --mouse /etc/resolv.conf ;;
     S|s) clear ; do_render_header "SYNC TIME" ; do_sync_time ; do_press_enter_to_continue ;;
     B|b) break ;;
     esac
