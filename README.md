@@ -2,7 +2,7 @@
 
 ## Description
 
-### WiFi support for the initramfs
+### Text-based user interface for the initramfs
 
 This package adds functionality to an initramfs built by initramfs-tools. When installed and enabled, the initramfs will display a grafical user interface which can be controlled with keyboard inputs.
 
