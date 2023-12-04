@@ -6,7 +6,9 @@
 
 This package adds functionality to an initramfs built by initramfs-tools. When installed and enabled, the initramfs will display a grafical user interface which can be controlled with keyboard inputs.
 
-Features include a network manager for LAN and WiFi, a crypto manager to manage LUKS keys, and to re-encrypt and resize a crypto partition. It is also possible to chroot to the root file system and to make changes to the system. This is particularly useful with a portable overlayfs protected root file system that normally does not allow changes. Many other features are available.
+Features include a network manager for LAN and WiFi, a crypto manager to manage LUKS keys, and to re-encrypt and resize a crypto partition. It is also possible to chroot to the root file system and to make changes to the system. This is particularly useful with a portable overlayfs protected root file system that normally does not allow changes.
+
+Also included is a file manager (mc), web browser (lynx), text editor (nano) and system monitor (htop) all with mouse support. It is also possible to start an SSH server in both initramfs and chroot!
 
 ## Installation
 
