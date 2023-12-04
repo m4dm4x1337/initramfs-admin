@@ -10,19 +10,15 @@ Features include a network manager for LAN and WiFi, a crypto manager to manage 
 
 Also included is a file manager (mc), web browser (lynx), text editor (nano) and system monitor (htop) all with mouse support. It is also possible to start an SSH server in both initramfs and chroot!
 
-## Installation
+![Screen record](https://raw.githubusercontent.com/m4dm4x1337/initramfs-admin/master/resources/imgaes/screen-rec.gif)
+
+## Preparations
 
 **This package is primarily intended for Ubuntu/Debian systems that have an encrypted root partition. If you do not have an encrypted system, you should NOT INSTALL this package!**
 
-Download the Debian package and run this commands:
-
-```bash
-sudo dpkg -i initramfs-admin_1.0_all.deb || sudo apt-get -f install
-```
-
 A quirk of this package is that it has soft dependencies instead of hard dependencies, so it is up to the user how much the initramfs grows by installing or not installing these soft dependencies.
 
-If you want to make sure that all features are available install the following packages:
+If you want to make sure that all features are available install the following packages first:
 
 ```bash
 apt install \
@@ -40,9 +36,17 @@ apt install \
   util-linux
 ```
 
-To have WiFi support in Initramfs, it is also recommended to install [Initramfs-Wifi](https://github.com/m4dm4x1337/initramfs-wifi).
+To have WiFi support in the initramfs, it is also recommended to install [Initramfs-Wifi](https://github.com/m4dm4x1337/initramfs-wifi).
 
 Since this package can currently only be used for encrypted systems, it is assumed that the packages `cryptsetup`, `cryptsetup-initramfs` and `lvm2` are already installed.
+
+## Installation
+
+Download the Debian package and run this commands:
+
+```bash
+sudo dpkg -i initramfs-admin_1.0_all.deb || sudo apt-get -f install
+```
 
 ## Configuration
 
