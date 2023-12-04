@@ -9,7 +9,7 @@ Package: initramfs-admin
 Architecture: all
 Depends: coreutils (>= 8.20-1), lsb-base, mount (>= 2.19.1-2), initramfs-tools (>= 0.100)
 Enhances: dropbear-initramfs, initramfs-wifi
-Suggests: cmatrix, cryptsetup, cryptsetup-initramfs, dropbear-initramfs, htop, initramfs-wifi, lvm2, lynx, mc, nano, netdiscover, openssh-client, openssh-server, parted, sharutils, util-linux
+Suggests: cmatrix, cryptsetup, cryptsetup-initramfs, dropbear-initramfs, e2fsprogs, htop, initramfs-wifi, lvm2, lynx, mc, nano, netdiscover, openssh-client, openssh-server, parted, sharutils, util-linux
 Homepage: https://github.com/m4dm4x1337/initramfs-admin
 Description: Initramfs based administration tool for encrypted root filesystems
  This package adds functionality to an initramfs built by initramfs-tools.
