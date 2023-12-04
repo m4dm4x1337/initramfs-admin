@@ -1,0 +1,211 @@
+#!/bin/sh
+
+# Initramfs-Admin (hook script)
+# Copyright (C) 2023 m4dm4x1337
+#
+# This file is part of the initramfs-admin debian package.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# no pre requirement
+PREREQ=""
+
+prereqs() {
+  echo "${PREREQ}"
+}
+
+case "$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# import /usr/share/initramfs-tools/scripts/functions
+. /usr/share/initramfs-tools/hook-functions
+
+# add /usr/lib/openssh to $PATH
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/lib/openssh
+
+###################
+# NEEDED COMMANDS #
+###################
+
+COMMANDS='
+cmatrix
+cryptsetup-reencrypt
+dumpe2fs
+e2fsck
+fdisk
+file
+fstrim
+gdisk
+htop
+lynx
+mc
+mcdiff
+mcedit
+mcview
+nano
+netdiscover
+nologin
+parted
+partprobe
+ping
+resize2fs
+scp
+setsid
+sftp-server
+ssh
+sshd
+unshare
+uudecode
+uuencode
+'
+
+for COMMAND in $COMMANDS; do
+
+  FILEPATH="$( which $COMMAND || true )"
+
+  if [ -z "$FILEPATH" ] || [ ! -e $FILEPATH ]; then
+    if [ "${verbose}" = "y" ]; then
+      echo "Skip non-existing command: $COMMAND"
+    fi
+    continue
+  fi
+
+  if [ -e "${DESTDIR}$FILEPATH" -o -e "${DESTDIR}/usr/sbin/$COMMAND" -o -e "${DESTDIR}/usr/bin/$COMMAND" -o -e "${DESTDIR}/sbin/$COMMAND" -o -e "${DESTDIR}/bin/$COMMAND" ]; then
+    if [ "${verbose}" = "y" ]; then
+      echo "Skip exitsing file: $FILEPATH"
+    fi
+    continue
+  fi
+
+  copy_exec $FILEPATH
+
+done
+
+################
+# CONFIG FILES #
+################
+
+FILELIST='
+/etc/localtime
+/etc/ssh
+/etc/ssl/certs/ca-certificates.crt
+/etc/lynx
+/etc/mc
+/lib/terminfo
+/usr/lib/mc
+/usr/share/doc/lynx-common
+/usr/share/doc/lynx
+/usr/share/mc
+'
+
+for FILEPATH in $FILELIST; do
+
+  if [ ! -e $FILEPATH ]; then
+    if [ "${verbose}" = "y" ]; then
+      echo "Skip non-existing file: $FILEPATH"
+    fi
+    continue
+  fi
+
+  if [ -e ${DESTDIR}$FILEPATH ]; then
+    if [ "${verbose}" = "y" ]; then
+      echo "Skip exitsing file: $FILEPATH"
+    fi
+    continue
+  fi
+
+  if [ -d $FILEPATH ]; then
+    DIRPATH=`readlink -f $FILEPATH`
+    if [ "${verbose}" = "y" ]; then
+      echo "copy_directory $DIRPATH"
+    fi
+    mkdir -p ${DESTDIR}$DIRPATH
+    cp -a $DIRPATH ${DESTDIR}${DIRPATH%/*}
+  else
+    copy_file config $FILEPATH $FILEPATH
+  fi
+
+done
+
+# create /etc/passwd /etc/group and /etc/shadow
+grep -q '^root:' ${DESTDIR}/etc/passwd 2>/dev/null || echo "root:x:0:0:root:/root:/usr/sbin/initramfs-admin" >> ${DESTDIR}/etc/passwd
+grep -q '^sshd:' ${DESTDIR}/etc/passwd 2>/dev/null || echo "sshd:x:74:74:sshd:/run/sshd:/sbin/nologin"       >> ${DESTDIR}/etc/passwd
+
+grep -q '^root:' ${DESTDIR}/etc/group  2>/dev/null || echo "root:x:0:"                                       >> ${DESTDIR}/etc/group
+grep -q '^sshd:' ${DESTDIR}/etc/group  2>/dev/null || echo "sshd:x:74:"                                      >> ${DESTDIR}/etc/group
+
+grep -q '^root:' ${DESTDIR}/etc/shadow 2>/dev/null || echo "root:*:18448:0:99999:7:::"                       >> ${DESTDIR}/etc/shadow
+grep -q '^sshd:' ${DESTDIR}/etc/shadow 2>/dev/null || echo "sshd:*:18448:0:99999:7:::"                       >> ${DESTDIR}/etc/shadow
+
+# get home dir of root user in initramfs, it may not
+# be /root if /etc/passwd was created by the dropbear hook
+ROOT_HOME="$( grep '^root:' ${DESTDIR}/etc/passwd | cut -f6 -d: | grep -F / || echo /root )"
+
+# create home dir and .ssh dir
+if [ ! -d "${DESTDIR}/$ROOT_HOME/.ssh" ]; then
+  mkdir -m 0700 -p "${DESTDIR}/$ROOT_HOME/.ssh"
+fi
+
+# create authorized_keys file
+if [ ! -f "${DESTDIR}/$ROOT_HOME/.ssh/authorized_keys" ]; then
+  touch "${DESTDIR}/$ROOT_HOME/.ssh/authorized_keys" &&
+  chmod 0400 "${DESTDIR}/$ROOT_HOME/.ssh/authorized_keys"
+fi
+
+# copy authorized keys
+if [ -s /root/.ssh/authorized_keys ]; then
+  while IFS= read -r KEY || [ -n "$KEY" ]; do
+    if ! grep -qxF "$KEY" "${DESTDIR}/$ROOT_HOME/.ssh/authorized_keys"; then
+      echo "$KEY" >> "${DESTDIR}/$ROOT_HOME/.ssh/authorized_keys"
+    fi
+  done </root/.ssh/authorized_keys
+fi
+
+# re-configure ssh
+if [ -e ${DESTDIR}/etc/ssh/ssh_config ]; then
+  sed --follow-symlinks --in-place 's/^\s*\#\?\s*StrictHostKeyChecking.*$/StrictHostKeyChecking no/g' ${DESTDIR}/etc/ssh/ssh_config
+  sed --follow-symlinks --in-place 's/^\s*\#\?\s*UserKnownHostsFile.*$/UserKnownHostsFile \/dev\/null/g' ${DESTDIR}/etc/ssh/ssh_config
+fi
+
+# re-configure sshd
+if [ -e ${DESTDIR}/etc/ssh/sshd_config ]; then
+  sed --follow-symlinks --in-place 's/^\s*\#\?\s*UsePAM.*$/UsePAM no/g' ${DESTDIR}/etc/ssh/sshd_config
+fi
+
+# fix link
+if [ -e ${DESTDIR}/usr/lib/openssh/sftp-server ]; then
+  ln -sf openssh/sftp-server ${DESTDIR}/usr/lib/sftp-server
+fi
+
+# allow initramfs-admin to run as normal script
+ln -sfr \
+  ${DESTDIR}/scripts/init-premount/initramfs-admin \
+  ${DESTDIR}/usr/sbin/initramfs-admin
+
+# create profile file for the ash shell
+cat << 'PROFILE' >${DESTDIR}/etc/profile
+if [ "$USER" = "root" ]; then
+  PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u\[\033[00m\]\[\033[01;31m\]@\[\033[00m\]\[\033[01;35m\]\h\[\033[00m\]\[\033[01;31m\]:\[\033[00m\]\[\033[01;33m\]\w\[\033[00m\]# '
+else
+  PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u\[\033[00m\]\[\033[01;31m\]@\[\033[00m\]\[\033[01;35m\]\h\[\033[00m\]\[\033[01;31m\]:\[\033[00m\]\[\033[01;33m\]\w\[\033[00m\]$ '
+fi
+if ls --help 2>&1 | grep -qF -- --color; then
+  alias ls='ls --color=auto'
+fi
+PROFILE
+

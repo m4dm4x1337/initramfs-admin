@@ -1,0 +1,7 @@
+dev-mode
+initramfs-admin_*_*
+initramfs-admin/debian/files
+initramfs-admin/debian/initramfs-admin/
+initramfs-admin/debian/initramfs-admin.substvars
+initramfs-admin/debian/initramfs-admin.debhelper.log
+initramfs-admin/debian/.debhelper/

@@ -1,0 +1,4637 @@
+#!/bin/sh
+
+# Initramfs-Admin (init-premount script)
+# Copyright (C) 2023 m4dm4x1337
+#
+# This file is part of the initramfs-admin debian package.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# required in newer Debian distributions to be able to start an init script manually.
+quiet=n
+
+# udev and initramfs-wifi is a pre requirement
+PREREQ="udev initramfs-wifi"
+
+prereqs() {
+  echo "${PREREQ}"
+}
+
+case "$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# contains the value of the initramfs-admin kernel parameter
+INITRAMFS_ADMIN=
+
+# contains the value of the cryptopts kernel parameter
+CRYPTOPTS=
+
+# parse kernel boot command line
+for CMD_PARAM in ${CMDLINE:=$( cat /proc/cmdline )}; do
+  case ${CMD_PARAM} in
+    initramfs[-.]admin=*)
+      INITRAMFS_ADMIN=${CMD_PARAM#initramfs[-.]admin=}
+      ;;
+    cryptopts=*)
+      CRYPTOPTS=${CMD_PARAM#cryptopts=}
+      ;;
+  esac
+done
+
+# https://busybox.net/FAQ.html#job_control
+if [ "$INITRAMFS_ADMIN" = "1" -o "$INITRAMFS_ADMIN" = "yes" ]; then     # we are running as init script
+  if [ -z "$CTTYHACK" ] && ! tty >/dev/null 2>&1; then                  # cttyhack has not been activated yet and there is no controlling terminal
+    if command -v setsid >/dev/null 2>&1; then                          # the setsid command is available
+      if command -v cttyhack >/dev/null 2>&1; then                      # the cttyhack command is available
+        CTTYHACK=1 setsid cttyhack "$0"                                 # apply cttyhack using the cttyhack command
+        exit $?                                                         # return exit status
+      else                                                              # else
+        read -r CONSOLE REST </proc/consoles                            # detect controlling terminal
+        if [ "${CONSOLE}" = "tty0" ]; then                              # if controlling terminal is tty0
+          CONSOLE="tty1"                                                # we need to choose a specific VT
+        fi
+        CTTYHACK=1 setsid sh -c "exec '$0' <>/dev/${CONSOLE} 1>&0 2>&1" # apply cttyhack same as in /scripts/functions (see 'panic' function)
+        exit $?                                                         # return exit status
+      fi
+    fi
+  fi
+fi
+
+# import /usr/share/initramfs-tools/scripts/functions
+. /scripts/functions
+
+# show begin msg
+log_begin_msg "Starting initramfs-admin"
+
+# define a tag for logging
+MYTAG=initramfs-admin
+
+# this script can also be called as normal (non-init) script
+if [ -L "$0" ]; then # /usr/sbin/initramfs-admin was called which means that
+FORCED_START=1       # we are running as a normal script and not as a init script
+fi
+
+# check if initramfs-admin is enabled
+if ! [ "$INITRAMFS_ADMIN" = "1" -o "$INITRAMFS_ADMIN" = "yes" -o "$INITRAMFS_ADMIN" = "dropbear" -o "$FORCED_START" = "1" ]; then
+  log_warning_msg "disabled, did not found boot parameter initramfs-admin=yes or initramfs-admin=1 or initramfs-admin=dropbear"
+  exit 0
+fi
+
+# hijack dropbear command
+if [ "$INITRAMFS_ADMIN" = "dropbear" ] && [ -z "$FORCED_START" ]; then
+  if [ ! -f /etc/dropbear/dropbear.conf ]; then
+      log_warning_msg "disabled, the file /etc/dropbear/dropbear.conf does not exist"
+  elif ! sed -i "s/\s*-I\s\+[0-9]\+\s*/ /g; s/^\(\s*DROPBEAR_OPTIONS=\"[^\"]*-c\s\+\)\('[^']*'\|\\\\\"[^\\\\\"]*\\\\\"\|\S\+\)\([^\"]*\"\)/\1initramfs-admin -I 31536000\3/" /etc/dropbear/dropbear.conf || ! grep -qF 'initramfs-admin' /etc/dropbear/dropbear.conf; then
+      log_failure_msg "disabled, the '-c' argument in 'DROPBEAR_OPTIONS' in the file '/etc/dropbear/dropbear.conf' could not be hijacked"
+  else
+    log_success_msg "enabled, the '-c' argument in 'DROPBEAR_OPTIONS' in the file '/etc/dropbear/dropbear.conf' was hijacked!"
+  fi
+  exit 0
+fi
+
+# check if needed kernel module for cryptsetup exists
+modprobe -qb dm-crypt
+if [ $? -ne 0 ]; then
+  log_failure_msg "missing kernel module dm-crypt"
+  exit 0
+fi
+
+# ensure empty vars in case of recursive script execution
+unset TARGET SOURCE KEY
+
+# try to read cryptroot config
+if [ -n "$CRYPTOPTS" ]; then # kernel cmdline parameter
+
+  OFS="$IFS"
+  IFS=","
+
+  for PARAM in $CRYPTOPTS; do
+    case $PARAM in
+      target=*) TARGET=${PARAM#target=} ;;
+      source=*) SOURCE=${PARAM#source=} ;;
+         key=*)    KEY=${PARAM#key=} ;;
+    esac
+  done
+
+  IFS="$OFS"
+  unset OFS
+
+elif [ -f /cryptroot/crypttab ]; then # used in newer versions
+
+  read TARGET SOURCE KEY OPTIONS < /cryptroot/crypttab # EXAMPLE: crypto-disk UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX /cryptroot/keyfiles/crypto-disk.key luks,initramfs
+
+elif [ -f /conf/conf.d/cryptroot ]; then # used in older versions
+
+  OFS="$IFS"
+  IFS=","
+
+  while IFS="" read -r LINE || [ -n "$LINE" ]; do # EXAMPLE: target=crypto-disk,source=UUID=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX,key=/cryptroot-keyfiles/crypto-disk.key,lvm=crypto-root
+    for PARAM in $LINE; do
+      case $PARAM in
+        target=*) TARGET=${PARAM#target=} ;;
+        source=*) SOURCE=${PARAM#source=} ;;
+           key=*)    KEY=${PARAM#key=} ;;
+      esac
+    done
+  done < /conf/conf.d/cryptroot
+
+  IFS="$OFS"
+  unset OFS
+else
+  log_failure_msg "missing cryptroot config file"
+  exit 0
+fi
+
+# validate settings of config file
+if [ -z "$TARGET" ]; then
+  log_failure_msg "'target' missing in cryptroot config"
+  exit 0
+elif [ -z "$SOURCE" ]; then
+  log_failure_msg "'source' missing in cryptroot config"
+  exit 0
+elif [ -z "$KEY" ]; then
+  log_failure_msg "'key' missing in cryptroot config"
+  exit 0
+fi
+
+# if key file can not be used
+if [ "$KEY" = "none" ]; then
+  KEY=""
+fi
+
+# root device may become ready delayed
+if [ ! -x "/sbin/wait-for-root" ]; then  # debian
+  : 
+elif ! "wait-for-root" "$SOURCE" 5 >/dev/null; then # ubuntu
+  log_failure_msg "root device '$SOURCE' unavailable after waiting 5 seconds"
+  exit 0
+fi
+
+# get device path of crypto partition (EXAMPLE: DEV=/dev/sda3)
+case "$SOURCE" in
+  *=*) DEV=$( blkid --list-one --output device --match-token "$SOURCE" 2>/dev/null ) ;;
+    *) DEV=$( blkid --output device "$SOURCE" 2>/dev/null ) ;;
+esac
+
+# check device path of crypto partition
+if [ -z "$DEV" ]; then
+  log_failure_msg "failed to determinate device path of crypto partition '$SOURCE'"
+  exit 0
+fi
+
+# check device path of crypto partition
+if [ ! -b "$DEV" ]; then
+  log_failure_msg "got device path '$DEV' from '$SOURCE' but it is not a block device"
+  exit 0
+fi
+
+# ensure that /dev/stdin exists
+[ -e /dev/stdin ] || ln -sT /proc/self/fd/0 /dev/stdin
+if [ $? -ne 0 ]; then
+  log_failure_msg "failed to create /dev/stdin"
+  exit 0
+fi
+
+# ensure that /dev/stdout exists
+[ -e /dev/stdout ] || ln -sT /proc/self/fd/1 /dev/stdout
+if [ $? -ne 0 ]; then
+  log_failure_msg "failed to create /dev/stdout"
+  exit 0
+fi
+
+# ensure that /dev/stderr exists
+[ -e /dev/stderr ] || ln -sT /proc/self/fd/2 /dev/stderr
+if [ $? -ne 0 ]; then
+  log_failure_msg "failed to create /dev/stderr"
+  exit 0
+fi
+
+# create the sshd pid directory /run/sshd
+[ -d /run/sshd ] || mkdir -p /run/sshd
+if [ $? -ne 0 ]; then
+  log_failure_msg "failed to create /run/sshd"
+  exit 0
+fi
+
+# create the log directory /var/log
+[ -d /var/log ] || mkdir -p /var/log
+if [ $? -ne 0 ]; then
+  log_failure_msg "failed to create /var/log"
+  exit 0
+fi
+
+# check if loopback interface exists
+if [ ! -d /sys/class/net/lo/ ]; then
+  log_failure_msg "the loopback interface '/sys/class/net/lo/' does not exist"
+  exit 0
+fi
+
+# read state of loopback interface
+if ! read -r STATE </sys/class/net/lo/operstate 2>/dev/null; then
+  log_failure_msg "the loopback interface state could not be read"
+  exit 0
+fi
+
+# configure loopback interface
+if [ "$STATE" != "up" ]; then
+  ip addr flush dev lo                      >>/tmp/lo.up.log 2>&1
+  ip addr add 127.0.0.1/8 dev lo scope host >>/tmp/lo.up.log 2>&1
+  [ ! -f /proc/net/if_inet6 ] ||
+  ip addr add ::1/128 dev lo scope host     >>/tmp/lo.up.log 2>&1
+  ip link set dev lo up                     >>/tmp/lo.up.log 2>&1
+fi
+
+# create .pids file (there can be more than one)
+echo $$ >>/run/$MYTAG.pids # kill in init-bottom if still running
+
+# The ROOT environment variable is NOT passed 
+# to this script if it was started manually
+for CMD_PARAM in $CMDLINE; do
+  case ${CMD_PARAM} in
+    ip=*)
+      IP=${IP:-${CMD_PARAM#ip=}}
+      ;;
+    root=*)
+      ROOT=${ROOT:-${CMD_PARAM#root=}}
+      ;;
+    rootdelay=*)
+      ROOTDELAY=${ROOTDELAY:-${CMD_PARAM#rootdelay=}}
+      ;;
+    rootflags=*)
+      ROOTFLAGS=${ROOTFLAGS:-${CMD_PARAM#rootflags=}}
+      ;;
+    rootfstype=*)
+      ROOTFSTYPE=${ROOTFSTYPE:-${CMD_PARAM#rootfstype=}}
+      ;;
+    esac
+done
+
+# detect hostname
+if [ -z "$HOSTNAME" -o "$HOSTNAME" = "(none)" ]; then
+  if [ -s /etc/hostname ] && HOSTNAME="$( cat /etc/hostname 2>/dev/null )" && [ -n "$HOSTNAME" ]; then
+    : # we are using the hostname in /etc/hostname
+  elif [ -z "${IP##*:*:*:*:*}" ] && HOSTNAME="${IP#*:*:*:*:}" && HOSTNAME="${HOSTNAME%%:*}" && [ -n "$HOSTNAME" ]; then
+    : # we are using the hostname in the kernel cmdline ip parameter
+  else
+    HOSTNAME="initramfs"
+  fi
+fi
+
+# detect terminal size
+IFS=' ' read -r LINES COLUMNS << SIZE
+$(stty size)
+SIZE
+
+# get $HOME from /etc/passwd
+if [ -z "$HOME" ] && [ -s /etc/passwd ]; then
+  HOME="$( grep '^root:' /etc/passwd | cut -f6 -d: )"
+fi
+
+# export important environment variables
+export ENV="${ENV:-/etc/profile}"
+export HOSTNAME="${HOSTNAME:-initramfs}"
+export HOME="${HOME:-/root}"
+export LANG="${LANG:-C.UTF-8}"
+export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+export PWD="${PWD:-${HOME}}"
+export SHELL="${SHELL:-/bin/sh}"
+export SHLVL="${SHLVL:-1}"
+export TERM="${TERM:-linux}"
+export USER="${USER:-root}"
+export USERNAME="${USER:-root}"
+export COLUMNS="${COLUMNS:-80}"
+export LINES="${LINES:-24}"
+export EDITOR=nano
+
+# if there is no hostname file create it
+[ -e /etc/hostname ] ||
+cat << HOSTNAME >/etc/hostname
+$HOSTNAME
+HOSTNAME
+
+# if there is no hosts file create it
+[ -e /etc/hosts ] ||
+cat << HOSTS >/etc/hosts
+127.0.0.1 localhost
+127.0.1.1 $HOSTNAME
+
+# The following lines are desirable for IPv6 capable hosts
+::1     ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+ff00::0 ip6-mcastprefix
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+ff02::3 ip6-allhosts
+HOSTS
+
+# set hostname
+if [ "$( hostname )" != "$HOSTNAME" ]; then
+  hostname $HOSTNAME
+fi
+
+# if there is no resolv.conf create it
+[ -s /etc/resolv.conf ] ||
+cat << RESOLV_CONF >/etc/resolv.conf
+nameserver 8.8.8.8 # $MYTAG
+nameserver 8.8.4.4 # $MYTAG
+RESOLV_CONF
+
+# if there is no home dir or .ssh dir create it
+[ -d "$HOME/.ssh" -o -L "$HOME/.ssh" ] || mkdir -m 0700 -p "$HOME/.ssh"
+if [ $? -ne 0 ]; then
+  ls -al "$HOME"
+  log_failure_msg "failed to create '$HOME/.ssh'"
+  exit 0
+fi
+
+# unicode
+#printf '\033%%G'
+#stty iutf8
+#LANG=C.UTF-8
+
+#INTR=`stty -g | cut -f5 -d:` # contains "3" if CTRL-C is supported
+#JOBC=`set -o | grep monitor | tr -s ' ' '\t' | cut -f2` # contains "on" if job control is supported
+
+# disable printk if we are running as init scipt
+if [ ! -L "$0" ]; then
+  PRINTK=$(cat /proc/sys/kernel/printk)
+  echo 0 >/proc/sys/kernel/printk
+else
+  PRINTK=
+fi
+
+do_cleanup() {
+  if [ -n "$PRINTK" ]; then
+    echo $PRINTK >/proc/sys/kernel/printk
+  fi
+}
+
+do_handle_signal() { # $1 = signal $2 = exit status
+
+  local input=
+
+  while true; do
+
+    if [ "$1" = "EXIT" -a "$2" -eq 0 ]; then
+      do_cleanup && exit 0
+    fi
+
+    do_clear_screen
+
+    do_render_header "ERROR HANDLER"
+
+    do_render_battery_status
+    do_render_network_status
+    echo ""
+    echo " SIGNAL: $1"
+    echo " STATUS: $2"
+    echo ""
+    [ $1 = EXIT ] &&
+    echo " E) EXIT" ||
+    echo " C) CONTINUE"
+    echo " R) REBOOT"
+    echo " P) POWEROFF"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || continue
+
+    case "$input" in
+      E|e) do_cleanup && exit 0 ;;
+      C|c) [ $1 = EXIT ] || return 0 ;;
+      R|r) do_reboot ;;
+      P|p) do_poweroff ;;
+    esac
+
+  done
+
+}
+
+trap : INT
+
+if [ -z "$FORCED_START" ]; then
+  trap 'do_handle_signal EXIT $?' EXIT
+  trap 'do_handle_signal HUP $?' HUP
+  trap 'do_handle_signal QUIT $?' QUIT
+  trap 'do_handle_signal ABRT $?' ABRT
+  trap 'do_handle_signal KILL $?' KILL
+  trap 'do_handle_signal ALRM $?' ALRM
+  trap 'do_handle_signal TERM $?' TERM
+# for SIG in HUP QUIT ABRT KILL ALRM TERM; do
+#   trap "do_handle_signal $sig $?" $sig
+# done
+fi
+
+do_read_pid_file() { # $1 = comm $2 = pid file
+
+  local pid= comm=
+
+  if [ ! -s "$2" ]; then
+    return 1 # file missing or empty
+  elif ! read -r pid < "$2" 2>/dev/null || [ -z "$pid" ]; then
+    return 2 # file read error
+  elif ! kill -0 $pid 2>/dev/null; then
+    return 1 # no running process found
+  elif ! read -r comm < /proc/$pid/comm || [ -z "$comm" ]; then
+    return 2 # file read error
+  elif [ "$comm" != "$1" ]; then
+    return 1 # pid does belong to another process
+  else
+    echo $pid
+  fi
+}
+
+do_kill_pid_file() { # $1 = comm $2 = pid file
+
+  local pid
+
+  if ! pid=$( do_read_pid_file "$1" "$2" ); then
+    if [ $? -eq 1 ]; then
+      return 0 # already killed
+    else
+      return 1 # I/O error
+    fi
+  fi
+
+  do_kill_pid $pid
+}
+
+do_kill_pid() { # $1 = pid
+
+  if ! kill -0 $1 2>/dev/null; then
+
+    return 0
+
+  fi
+
+  kill $1
+
+  sleep 1
+
+  if kill -0 $1 2>/dev/null; then
+
+    kill -KILL $1
+
+    sleep 1
+
+  fi
+
+  ! kill -0 $1 2>/dev/null
+}
+
+do_wpa_state_get() { # $1 = interface
+  wpa_cli status -p/run/wpa_supplicant -i$1  2>/dev/null | {
+    local key= value=
+    while IFS='=' read -r key value; do
+      if [ "$key" = "wpa_state" ]; then
+        echo "$value" && return 0
+      fi
+    done
+    return 1
+  }
+}
+
+do_wpa_check_running() {
+  do_wpa_pid_get >/dev/null
+}
+
+do_wpa_pid_get() {
+  do_read_pid_file wpa_supplicant /run/wpa_supplicant.pid
+}
+
+do_wpa_kill() { # $1 = interface
+
+  local pid=
+
+  if ! pid=$( do_wpa_pid_get ); then
+    return 0
+  elif ! wpa_cli terminate -p/run/wpa_supplicant -i$1; then
+    sleep 1
+  fi
+
+  do_kill_pid $pid
+}
+
+do_wpa_log_tail() {
+
+  do_clear_screen
+
+  if [ ! -f /run/wpa_supplicant.log ]; then
+    do_render_failure "Log file does not exist"
+    do_press_enter_to_continue
+    return 0
+  fi
+
+  tail -n 20 -s 1 -f \
+    /run/wpa_supplicant.log \
+    /run/wpa_supplicant.err
+}
+
+do_wpa_status() {
+
+  local interface="$wlan"
+
+  do_clear_screen
+
+  do_render_header "WLAN STATUS"
+
+  if [ -z "$interface" ]; then
+    do_render_failure "No wireless interface found"
+    do_press_enter_to_continue
+    return 1
+  elif ! do_wpa_check_running; then
+    do_render_failure "wpa_supplicant is not running"
+    do_press_enter_to_continue
+    return 2
+  fi
+
+  echo -e "$( wpa_cli -p /run/wpa_supplicant -i$interface status | sed 's/^\([^=]\+\)=\(.*\)$/ \\033[1;37m\1:\\033[0m \\033[1;36m\2\\033[0m/g' )"
+
+  do_press_enter_to_continue
+}
+
+do_wpa_config() {
+
+  local interface="$wlan"
+
+  local ap_scan country scan_ssid ssid psk
+
+  local wpa_state
+
+  local input=
+
+  do_wpa_config_read
+
+  while true; do
+
+    do_clear_screen
+
+    wpa_state=$( do_wpa_state_get $interface )
+
+#   case ${wpa_state:=NOT RUNNING} in
+#        COMPLETED) wpa_state="\033[1;32m${wpa_state}\033[0m" ;;
+#     DISCONNECTED) wpa_state="\033[1;33m${wpa_state}\033[0m" ;;
+#                *) wpa_state="\033[1;35m${wpa_state}\033[0m" ;;
+#   esac
+
+    do_render_header "WLAN ACCESS POINT" "${wpa_state:-NOT RUNNING}"
+
+    echo -e " 1)      SSID: \033[1;36m${ssid}\033[0m"
+    echo -e " 2)  PASSWORD: \033[1;36m${psk}\033[0m"
+    echo ""
+    echo -e " 3)   COUNTRY: \033[1;36m${country}\033[0m"
+    echo -e " 4)   AP SCAN: \033[1;36m${ap_scan}\033[0m"
+    echo -e " 5) SCAN SSID: \033[1;36m${scan_ssid}\033[0m"
+    echo ""
+    echo " D) DUMP CONFIG"
+    echo " S) SHOW STATUS"
+    echo " V) VIEW LOGS"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      1) do_wpa_config_ssid ;;
+      2) do_wpa_config_psk ;;
+      3) do_wpa_config_country ;;
+      4) do_wpa_config_ap_scan ;;
+      5) do_wpa_config_scan_ssid ;;
+    D|d) do_wpa_config_dump ;;
+    S|s) do_wpa_status ;;
+    V|v) do_wpa_log_tail ;;
+    B|b) break ;;
+    esac
+
+  done
+
+  do_wpa_config_write
+}
+
+do_wpa_config_ssid() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " SSID: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -z "$abort" ]; then
+    ssid="$input"
+  fi
+}
+
+do_wpa_config_psk() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " PASSWORD: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -z "$abort" ]; then
+    psk="$input"
+  fi
+}
+
+do_wpa_config_country() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " COUNTRY: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -z "$abort" ]; then
+    country="$input"
+  fi
+}
+
+do_wpa_config_ap_scan() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "WLAN ACCESS POINT" "AP SCAN"
+
+    echo " 0) Driver takes care of scanning"
+    echo " 1) wpa_supplicant initiates scanning (default)"
+    echo ""
+    echo " I) Ignore (comment out this option)"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      0) ap_scan=0 ;;
+      1) ap_scan=1 ;;
+    I|i) ap_scan= ;;
+    B|b) return 0 ;;
+      *) continue ;;
+    esac
+
+    break
+
+  done
+}
+
+do_wpa_config_scan_ssid() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "WLAN ACCESS POINT" "SCAN SSID"
+
+    echo " 0) Do not scan this SSID (default)"
+    echo " 1) Scan with SSID-specific Probe Request frames"
+    echo ""
+    echo " I) Ignore (comment out this option)"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      0) scan_ssid=0 ;;
+      1) scan_ssid=1 ;;
+    I|i) scan_ssid= ;;
+    B|b) return 0 ;;
+      *) continue ;;
+    esac
+
+    break
+
+  done
+}
+
+do_wpa_config_dump() {
+  clear
+  echo "----------------------------------------"
+  do_wpa_config_render
+  echo "----------------------------------------"
+  do_press_enter_to_continue
+}
+
+do_wpa_config_read() {
+
+  if [ ! -e /etc/wpa_supplicant.conf ]; then
+    ap_scan= country= scan_ssid= ssid= psk=
+    return 0
+  fi
+
+. /dev/stdin << EOT
+$( do_wpa_config_parse )
+EOT
+
+}
+
+do_wpa_config_parse() {
+  local line=
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}" # strip comment
+    line="${line#"${line%%[![:space:]]*}"}" # ltrim
+    line="${line%"${line##*[![:space:]]}"}" # rtrim
+    case "$line" in
+      ap_scan=*|country=*|scan_ssid=*|ssid=*|psk=*)
+        echo "$line"
+        ;;
+    esac
+  done < /etc/wpa_supplicant.conf
+}
+
+do_wpa_config_write() {
+
+  local stderr=
+
+  if ! stderr=$( ( do_wpa_config_render > /etc/wpa_supplicant.conf ) 2>&1 ); then
+    do_render_failure "${stderr:-Failed to write /etc/wpa_supplicant.conf}"
+    do_press_enter_to_continue
+  fi
+}
+
+do_wpa_config_render() {
+local comment_ap_scan=
+local comment_country=
+local comment_scan_ssid=
+[ -n "$ap_scan"   ] || comment_ap_scan='#'
+[ -n "$country"   ] || comment_country='#'
+[ -n "$scan_ssid" ] || comment_scan_ssid='#'
+cat << EOT
+ctrl_interface=/run/wpa_supplicant
+${comment_ap_scan}ap_scan=${ap_scan:-1}
+${comment_country}country=${country}
+
+network={
+  ${comment_scan_ssid}scan_ssid=${scan_ssid:-0}
+  ssid="$ssid"
+  psk="$psk"
+}
+EOT
+}
+
+do_interface_status() { # $1 = interface type (lan/wlan)
+
+  local interface=
+
+  case "$1" in
+    wlan) interface="$wlan" ;;
+     lan) interface="$lan" ;;
+       *) return 1 ;;
+  esac
+
+  do_clear_screen
+
+  do_render_header "INTERFACE STATUS" "$1"
+
+  echo -e "$( ifconfig "$interface" | sed 's/\([0-9]\+\(\.[0-9]\+\)\{3\}\)/\\033[1;36m\1\\033[0m/g' )"
+
+  do_press_enter_to_continue
+}
+
+do_interface_config() { # $1 = interface type (lan/wlan)
+
+  local address server gateway netmask hostname interface autoconf dns0 dns1 ntp0 input
+
+  do_interface_config_read "$1"
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "CONFIG" "$1"
+
+    echo -e " 1) INTERFACE: \033[1;36m$interface\033[0m"
+    echo -e " 2)    METHOD: \033[1;36m$autoconf\033[0m"
+    echo ""
+    echo -e " 3)   ADDRESS: \033[1;36m$address\033[0m"
+    echo -e " 4)   NETMASK: \033[1;36m$netmask\033[0m"
+    echo -e " 5)   GATEWAY: \033[1;36m$gateway\033[0m"
+    echo ""
+    echo -e " 6)      DNS0: \033[1;36m$dns0\033[0m"
+    echo -e " 7)      DNS1: \033[1;36m$dns1\033[0m"
+    echo ""
+    echo " D) DEEP SCAN"
+    echo " F) FAST SCAN"
+#   echo " V) VALIDATE"
+    [ "$1" = "wlan" ] &&
+    echo "" &&
+    echo " W) WIFI CONFIG"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case $input in
+      1) do_interface_config_interface $1 ;;
+      2) do_interface_config_method $1 ;;
+      3) do_interface_config_address $1 ;;
+      4) do_interface_config_netmask $1 ;;
+      5) do_interface_config_gateway $1 ;;
+      6) do_interface_config_dns0 $1 ;;
+      7) do_interface_config_dns1 $1 ;;
+    D|d) do_network_scan $1 deep ;;
+    F|f) do_network_scan $1 fast ;;
+#   V|v) do_interface_config_validate $1 ; do_press_enter_to_continue ;;
+    W|w) do_wpa_config ;;
+    B|b) break ;;
+    esac
+
+  done
+
+  do_interface_config_write $1
+
+}
+
+do_network_scan() {
+
+  local interface autoconf address gateway netmask dns0 dns1
+
+  local args= state= wpa_start=
+
+  do_interface_config_read "$1"
+
+  args="-i $interface -d"
+
+  if [ "$2" = "fast" ]; then
+    args="$args -f"
+  fi
+
+  do_clear_screen
+
+  if ! state=$( do_get_interface_state "$interface" ); then
+    return 1
+  fi
+
+  if [ "$1" != "wlan" ]; then
+    if [ "$state" != "up" ]; then
+      ip link set dev $interface up
+    fi
+  elif do_wpa_check_running; then
+    if [ "$( do_wpa_state_get $interface )" != "COMPLETED" ]; then
+      do_render_failure "wpa_supplicant is already running but not connected to any access point"
+      do_press_enter_to_continue
+      return 0
+    fi
+  elif ! do_wpa_start; then
+    do_wpa_stop
+    do_render_failure "Could not connected to the access point"
+    do_press_enter_to_continue
+    return 0
+  else
+    wpa_start=1
+    do_press_enter_to_continue
+    do_clear_screen
+  fi
+
+  netdiscover $args
+
+  if [ -z "$wpa_start" ]; then
+    :
+  elif ! do_wpa_stop; then
+    :
+  fi
+
+  if [ "$state" != "up" ]; then
+    ip link set dev $interface down
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_interface_config_interface() { # $1 = interface type (lan/wlan)
+
+  local filename index iface itype macaddr items input
+
+  while true; do
+
+    do_clear_screen
+
+    index=0
+
+    do_render_header "INTERFACES" "$1"
+
+    for filename in /sys/class/net/*; do
+      if [ -d "$filename/device" ]; then
+        iface="${filename##*/}"
+        if [ -d "$filename/wireless" ]; then
+          itype=wlan
+        else
+          itype=lan
+        fi
+        if [ "$itype" = "$1" ]; then
+          if ! read -r macaddr < "/sys/class/net/$iface/address" 2>/dev/null; then
+            macaddr="00:00:00:00:00:00"
+          fi
+          echo " $index) $iface [$macaddr]"
+          items="${items:+$items,}$iface"
+          index=$(( index + 1 ))
+        fi
+      fi
+    done
+
+    if [ -z "$items" ]; then
+      echo -e "\033[1;33m No $1 interfaces found!\033[0m"
+    fi
+
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    if [ -n "${input##*[!0-9]*}" ]; then
+      if ! iface=$( do_get_item "$input" "$items" ); then
+        continue
+      else
+        break
+      fi
+    fi
+
+    case "$input" in
+    B|b) return 0 ;;
+    esac
+
+  done
+
+  interface="$iface"
+}
+
+do_get_item() { # $1 = index $2 = items $3 = separator (',') $4 = default
+
+  local index="$1"
+  local items="$2"
+  local IFS="${3:-,}"
+  local default="$4"
+  local argc="$#"
+
+  set -- $items
+
+  if [ -z "${index##*[!0-9]*}" ] || [ "$index" -lt 0 -o "$index" -ge "$#" ]; then
+    if [ "$argc" -ge 4 ]; then
+      echo "$default"
+    fi
+    return 1
+  fi
+
+  shift $index
+
+  echo "${1:-$default}"
+}
+
+do_interface_config_method(){
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "CONFIG METHODS" "$1"
+
+    echo " 1) DHCP"
+    echo " 2) STATIC"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      1) autoconf=dhcp ;;
+      2) autoconf=static ;;
+    B|b) return 0 ;;
+      *) continue ;;
+    esac
+
+    break
+
+  done
+}
+
+do_interface_config_address() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " ADDRESS: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -n "$abort" ]; then
+    return 0
+  elif [ -z "$input" ]; then
+    address=""
+    return 0
+  elif ip4_is_valid "$input"; then
+    address="$input"
+    return 0
+  fi
+
+  do_render_failure "Invalid address: $input"
+  sleep 2
+}
+
+do_interface_config_netmask() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " NETMASK: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -n "$abort" ]; then
+    return 0
+  elif [ -z "$input" ]; then
+    netmask=""
+    return 0
+  elif [ -n "${input##*[!0-9]*}" ] && [ "$input" -ge 0 -a "$input" -le 32 ]; then
+    netmask="$( ip4_from_int32 $( bits4_to_mask4 $input ) )"
+    return 0
+  elif netmask4_is_valid "$input"; then
+    netmask="$input"
+    return 0
+  fi
+
+  do_render_failure "Invalid netmask: $input"
+  sleep 2
+}
+
+do_interface_config_gateway() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " GATEWAY: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -n "$abort" ]; then
+    return 0
+  elif [ -z "$input" ]; then
+    gateway=""
+    return 0
+  elif ip4_is_valid "$input"; then
+    gateway="$input"
+    return 0
+  fi
+
+  do_render_failure "Invalid gateway: $input"
+  sleep 2
+}
+
+do_interface_config_dns0() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " DNS0: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -n "$abort" ]; then
+    return 0
+  elif [ -z "$input" ]; then
+    dns0=""
+    return 0
+  elif ip4_is_valid "$input"; then
+    dns0="$input"
+    return 0
+  fi
+
+  do_render_failure "Invalid dns0: $input"
+  sleep 2
+}
+
+do_interface_config_dns1() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " DNS1: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -n "$abort" ]; then
+    return 0
+  elif [ -z "$input" ]; then
+    dns1=""
+    return 0
+  elif ip4_is_valid "$input"; then
+    dns1="$input"
+    return 0
+  fi
+
+  do_render_failure "Invalid dns1: $input"
+  sleep 2
+}
+
+ip4_is_valid(){ # $1 = ip4 (n.n.n.n)
+  ip4_to_int32 "$1" >/dev/null
+}
+
+netmask4_is_valid() { # $1 = ip4 (n.n.n.n)
+  local addr=$( ip4_to_int32 $1 )
+  [ 0 -eq $(( addr & ((~addr & 0xFFFFFFFF) >> 1) )) ]
+}
+
+bits4_to_mask4() { # $1 = bits (int32)
+  local bits=$1
+  echo $(( 0xffffffff << 32 - bits ))
+}
+
+mask4_to_bits4() { # $1=netmask (a.b.c.d)
+  if ! netmask4_is_valid $1; then
+    echo "Invalid Netmask: $1" >&2
+    return 1
+  fi
+  popcount32 $( ip4_to_int32 $1 )
+}
+
+popcount32() { # $1=int32
+
+  local i=$(( $1 & 0xFFFFFFFF ))
+
+  i=$((   i - ((i >> 1)  & 0x55555555) ))
+  i=$((       ((i >> 2)  & 0x33333333) + (i & 0x33333333) ))
+  i=$(( ((i +  (i >> 4)) & 0x0F0F0F0F) ))
+  i=$(( ((i * (0x01010101)) >> 24) & 0x3F ))
+
+  echo $i
+}
+
+
+cidr4_to_net4() {
+
+  local ip=${1%%/*} bits=32
+
+  if [ -z "${1##*/[0-9]*}" ]; then
+    bits=${1##*/}
+  fi
+
+  echo $( ip4_from_int32 $(( `ip4_to_int32 $ip` & `bits4_to_mask4 $bits` )) )/$bits
+}
+
+ip4_from_int32() { # $1 = addr (int32)
+  local addr=$1
+  echo $(( addr >> 24 & 255 )).$(( addr >> 16 & 255 )).$(( addr >> 8 & 255 )).$(( addr & 255 ))
+}
+
+ip4_to_int32() { # $1 = ip4 (n.n.n.n)
+
+  local a b c d
+
+  IFS='.' read -r a b c d << IP4
+$1
+IP4
+
+  # numeric check
+  [ -n "${a##*[!0-9]*}" -a \
+    -n "${b##*[!0-9]*}" -a \
+    -n "${c##*[!0-9]*}" -a \
+    -n "${d##*[!0-9]*}" ] || return 1
+
+  # trim leading zeros
+  a=${a#${a%%[!0]*}}
+  b=${b#${b%%[!0]*}}
+  c=${c#${c%%[!0]*}}
+  d=${d#${d%%[!0]*}}
+
+  # zero if empty
+  a=${a:-0}
+  b=${b:-0}
+  c=${c:-0}
+  d=${d:-0}
+
+  # range check
+  [ "$a" -ge 0 -a "$a" -le 255 -a \
+    "$b" -ge 0 -a "$b" -le 255 -a \
+    "$c" -ge 0 -a "$c" -le 255 -a \
+    "$d" -ge 0 -a "$d" -le 255 ] || return 2
+
+  echo $(( ( a << 24 ) | ( b << 16 ) | ( c << 8 ) | d ))
+
+}
+
+do_interface_config_read() { # $1 = interface type (lan/wlan)
+
+  local server hostname ntp0
+
+  address= server= gateway= netmask= hostname= interface= autoconf=dhcp dns0= dns1= ntp0=
+
+  if [ -s "/etc/$1.conf" ]; then
+    IFS=':' read -r address server gateway netmask hostname interface autoconf dns0 dns1 ntp0 < /etc/$1.conf 2>/dev/null
+  fi
+
+  if [ -n "$interface" ]; then
+    if [ "$1" = "wlan" ]; then
+      if ! [ -d "/sys/class/net/$interface/device" -o -d "/sys/class/net/$interface/wireless" ]; then
+        interface=
+      fi
+    else
+      if ! [ -d "/sys/class/net/$interface/device" ]; then
+        interface=
+      fi
+    fi
+  fi
+
+  if [ -z "$interface" ]; then
+    interface=$( do_get_interface_by_type "$1" )
+  fi
+}
+
+do_interface_config_write() { # $1 = interface type (lan/wlan)
+
+  local stderr=
+
+  if [ -z "$interface" ]; then
+    do_render_failure "No interface was selected"
+  elif [ ! -L "/sys/class/net/$interface" ]; then
+    do_render_failure "The interface '$interface' does not exist"
+  elif [ ! -d "/sys/class/net/$interface/device/" ]; then
+    do_render_failure "The interface '$interface' is not a physical device"
+  elif ! stderr=$( ( echo "$address:$server:$gateway:$netmask:$hostname:$interface:$autoconf:$dns0:$dns1:$ntp0" > /etc/$1.conf ) 2>&1 ); then
+    do_render_failure "${stderr:-Failed to write /etc/$1.conf}"
+  else
+    return 0
+  fi
+
+  do_press_enter_to_continue
+
+  return 0
+}
+
+do_get_interface_address() { # $1 = interface
+  ip -4 addr show dev "$1" | {
+    local a b c
+    while read -r a b c; do
+      case "$a:$b" in
+        inet:*/*) echo ${b%/*} && return 0 ;;
+      esac
+    done
+    return 1
+  }
+}
+
+do_get_interface_metric() { # $1 = interface
+
+  local ifindex
+
+  if [ ! -e "/sys/class/net/$1/ifindex" ]; then
+    echo $(( 1 << 32 ))
+    return 0
+  fi
+
+  if ! read -r ifindex < /sys/class/net/$1/ifindex 2>/dev/null || [ -z "$ifindex" ]; then
+    ifindex=${1##*[!0-9]}
+  fi
+
+  if [ -z "${ifindex##*[!0-9]*}" ]; then
+    ifindex=0
+  fi
+
+  if [ -d "/sys/class/net/$1/wireless/" ]; then
+    echo $(( 2048 + ifindex ))
+  else
+    echo $((  512 + ifindex ))
+  fi
+}
+
+do_get_interface_state() { # $1 = interface
+  if [ ! -e "/sys/class/net/$1/operstate" ]; then
+    return 1
+  elif ! read -r state < /sys/class/net/$1/operstate 2>/dev/null; then
+    echo "$unknown"
+  else
+    echo "$state"
+  fi
+}
+
+do_get_interface_by_type() { # $1 = interface type (lan/wlan) $2 = state (up/down)
+
+  local filename iface itype state
+
+  for filename in /sys/class/net/*; do
+    if [ -d "$filename/device" ]; then
+      iface="${filename##*/}"
+      if [ -d "$filename/wireless" ]; then
+        itype=wlan
+      else
+        itype=lan
+      fi
+      if [ -z "$2" ]; then
+        state=
+      else
+        state=$( do_get_interface_state "$iface" )
+      fi
+      if [ "$itype" = "$1" -a "$state" = "$2" ]; then
+        echo "$iface" && return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+do_render_header() { # $1 = title $2 = subtitle
+
+  echo ""
+  echo -e " $1${2:+ (\033[1;36m$2\033[0m)}"
+  printf ' '
+  printf "%$(( ${#1} + ( ${#2} > 0 ? ${#2} + 3 : 0 ) ))s\n" | tr ' ' '='
+  echo ""
+}
+
+do_render_action() { # $1 = message
+# echo ""
+  printf " \033[1;37m%s\033[0m%$(( 39 - ${#1} ))s" "$1"
+}
+
+do_render_begin() { # $1 = message
+# echo ""
+  printf " \033[1;37m%s" "$1"
+}
+
+do_render_end() { # $1 = message
+  printf "\033[0m%$(( 39 - ${#1} ))s" ""
+}
+
+do_render_failure() { # $1 = message
+  echo -e " \033[1;31m$1\033[0m"
+  echo ""
+}
+
+do_render_success() { # $1 = message $2 = additional info
+  echo -e " \033[1;32m$1\033[0m${2:+ $2}"
+  echo ""
+}
+
+do_render_warning() { # $1 = message
+  echo -e " \033[1;33m$1\033[0m"
+  echo ""
+}
+
+do_render_notice() { # $1 = message
+  echo -e " \033[1;37m$1\033[0m"
+  echo ""
+}
+
+do_press_enter_to_continue() {
+
+  local input=
+
+  echo ""
+  echo ""
+  echo -n " Press ENTER to continue"
+  read -s -r input
+}
+
+do_interface_config_validate() { # $1 = interface type (lan/wlan)
+
+  do_render_action "Validate Network Configuration"
+
+  if [ -z "$interface" ]; then
+    do_render_failure "No interface defined"
+  elif [ ! -d "/sys/class/net/$interface/device" ]; then
+    do_render_failure "Invalid interface: '$interface'"
+  elif [ "$1" = "wlan" ] && [ ! -d "/sys/class/net/$interface/wireless" ]; then
+    do_render_failure "Invalid wireless interface: '$interface'"
+
+
+  elif [ -z "$autoconf" ]; then
+    do_render_failure "Empty autoconf"
+  elif [ "$autoconf" != "static" -a "$autoconf" != "dhcp" ]; then
+    do_render_failure "Invalid autoconf $autoconf"
+
+
+  elif [ "$autoconf" = "dhcp" ]; then
+    do_render_success "OK"
+    return 0
+
+
+  elif [ -z "$address" ]; then
+    do_render_failure "Empty address"
+  elif ! ip4_is_valid "$address"; then
+    do_render_failure "Invalid address $address"
+
+
+  elif [ -z "$netmask" ]; then
+    do_render_failure "Empty netmask"
+  elif ! netmask4_is_valid "$netmask"; then
+    do_render_failure "Invalid netmask $netmask"
+
+
+  elif [ -z "$gateway" ]; then
+    do_render_failure "Empty gateway"
+  elif ! ip4_is_valid "$gateway"; then
+    do_render_failure "Invalid gateway $gateway"
+
+
+  elif [ -z "$dns0" ]; then
+    do_render_failure "empty dns0"
+  elif ! ip4_is_valid "$dns0"; then
+    do_render_failure "Invalid dns0 $dns0"
+
+
+  elif [ -n "$dns1" ] && ! ip4_is_valid "$dns1"; then
+    do_render_failure "Invalid dns1 $dns1"
+
+  else
+    do_render_success "OK"
+    return 0
+  fi
+
+  return 1
+}
+
+do_interface_up() { # $1 = interface type (lan/wlan)
+
+  local interface autoconf address gateway netmask broadcast dns0 dns1
+
+  do_clear_screen
+
+  do_render_header "INTERFACE UP" "$1"
+
+  do_interface_config_read "$1"
+
+  if ! do_interface_config_validate $1; then
+    :
+  elif ! do_network_deconfigure $1; then
+    :
+  elif [ "$1" = "wlan" ] && ! do_wpa_stop ; then
+    :
+  elif ! do_select_interface $1; then
+    :
+  elif [ "$1" = "wlan" ] && ! do_wpa_start ; then
+    do_wpa_stop
+  elif [ "$autoconf" = "dhcp" ] && ! do_retrieve_dhcp_lease $1; then
+    :
+  elif ! do_configure_interface $1; then
+    :
+  elif ! do_test_lan_connectivity $1; then
+    :
+  elif ! do_test_wan_connectivity $1; then
+    :
+  elif ! do_test_dns_connectivity $1; then
+    :
+  elif ! do_sync_time $1; then
+    :
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_interface_down() { # $1 = interface type (lan/wlan)
+
+  do_clear_screen
+
+  do_render_header "INTERFACE DOWN" "$1"
+
+  [ "$1" != "wlan" ] || do_wpa_stop
+
+  do_network_deconfigure $1
+
+  do_press_enter_to_continue
+}
+
+do_network_deconfigure() { # $1 = interface type (lan/wlan)
+
+  local interface=
+
+  case "$1" in
+    wlan) interface="$wlan" ;;
+     lan) interface="$lan" ;;
+       *) return 1 ;;
+  esac
+
+  do_render_action "Deconfigure Network Interface $interface"
+
+  rm -f \
+    /tmp/$interface.up.log \
+    /tmp/$interface.up.err \
+    /tmp/$interface.down.log \
+    /tmp/$interface.down.err \
+    /tmp/$interface.dhcp.log \
+    /tmp/$interface.dhcp.err \
+    /tmp/$interface.dhcp.success \
+    /tmp/$interface.dhcp.failed \
+    /tmp/$interface.lan.success \
+    /tmp/$interface.lan.failed \
+    /tmp/$interface.wan.success \
+    /tmp/$interface.wan.failed \
+    /tmp/$interface.dns.success \
+    /tmp/$interface.dns.failed
+
+  ip link set dev $interface down 1>>/tmp/$interface.down.log 2>>/tmp/$interface.down.err
+  ip route flush dev $interface   1>>/tmp/$interface.down.log 2>>/tmp/$interface.down.err
+  ip addr flush dev $interface    1>>/tmp/$interface.down.log 2>>/tmp/$interface.down.err
+
+  if [ -e /proc/sys/net/ipv4/conf/$interface/rp_filter ]; then
+    echo 1 >/proc/sys/net/ipv4/conf/$interface/rp_filter 2>>/tmp/$interface.down.err
+  fi
+
+  if [ -e /etc/resolv.conf ]; then
+    sed -i "/\#\s*$1/d" /etc/resolv.conf
+  fi
+
+  do_render_success "OK"
+}
+
+do_wpa_stop() {
+
+  do_render_action "Disconnect from Access Point"
+
+  if ! do_wpa_kill "$wlan" >>/run/wpa_supplicant.log 2>>/run/wpa_supplicant.err; then
+    do_render_failure "FAILED"
+    return 1
+  fi
+
+  rm -fr \
+    /run/wpa_supplicant.pid \
+    /run/wpa_supplicant
+
+  do_render_success "OK"
+}
+
+do_select_interface() { # $1 = interface type (lan/wlan)
+  case "$1" in
+    wlan) wlan="$interface" ;;
+     lan)  lan="$interface" ;;
+  esac
+}
+
+do_wpa_start() {
+
+  local title="Connecting Access Point" limit=15
+
+  do_render_begin "$title"
+
+  rm -fr \
+    /run/wpa_supplicant.log \
+    /run/wpa_supplicant.err \
+    /run/wpa_supplicant.pid \
+    /run/wpa_supplicant
+
+  if ! wpa_supplicant -B -i$interface -c/etc/wpa_supplicant.conf -P/run/wpa_supplicant.pid -f/run/wpa_supplicant.log 1>/run/wpa_supplicant.err 2>&1; then 
+    do_render_end "$title"
+    do_render_failure "CONFIG ERROR"
+    return 1
+  fi
+
+  while [ $limit -gt 0 ] && [ "$( do_wpa_state_get $interface )" != "COMPLETED" ]; do
+    sleep 1
+    echo -e -n "."
+    title="$title."
+    limit=$(( limit - 1 ))
+  done
+
+  if [ "$( do_wpa_state_get $interface )" != "COMPLETED" ]; then
+    do_render_end "$title"
+    do_render_failure "FAILED"
+    do_wpa_kill $interface >>/run/wpa_supplicant.log 2>>/run/wpa_supplicant.err 1>&2
+    return 2
+  else
+    do_render_end "$title"
+    do_render_success "OK" #  $( do_render_link_quality $interface )
+    return 0
+  fi
+}
+
+do_retrieve_dhcp_lease() {
+
+  local pid= limit=15 title="Retrieve DHCP lease on $interface"
+
+  local quotes key value
+
+  do_render_begin "$title"
+
+  address=
+  netmask=
+  gateway=
+  broadcast=
+  dns0=
+  dns1=
+
+  rm -f \
+    /run/net-$interface.conf \
+    /tmp/$interface.dhcp.log \
+    /tmp/$interface.dhcp.err \
+    /tmp/$interface.dhcp.success \
+    /tmp/$interface.dhcp.failed
+
+  # speed up ipconfig
+  ip link set dev $interface up 1>>/tmp/$interface.dhcp.log 2>>/tmp/$interface.dhcp.err
+
+  # man page: https://git.kernel.org/pub/scm/libs/klibc/klibc.git/plain/usr/kinit/ipconfig/README.ipconfig
+  ipconfig -n -t "$limit" -d "$interface" >/tmp/$interface.dhcp.log 2>/tmp/$interface.dhcp.err &&
+    touch /tmp/$interface.dhcp.success ||
+    touch /tmp/$interface.dhcp.failed & pid=$!
+
+  while [ $limit -gt 0 ] && ! [ -f /tmp/$interface.dhcp.success -o -f /tmp/$interface.dhcp.failed ]; do
+    sleep 1
+    echo -e -n "."
+    title="$title."
+    limit=$(( limit - 1 ))
+  done
+
+  do_kill_pid $pid
+
+  do_render_end "$title"
+
+  if [ ! -f /tmp/$interface.dhcp.success ]; then
+    do_render_failure "FAILED"
+    return 1
+  elif [ ! -s /run/net-$interface.conf ]; then
+    do_render_failure "FAILED"
+    return 2
+  fi
+
+  quotes="'\"" # NOTE ' in IFS does not work!
+  while IFS="=$IFS" read -r key value || [ -n "$key$value" ]; do
+    value="${value#"${value%%[!$quotes]*}"}" # ltrim quotes
+    value="${value%"${value##*[!$quotes]}"}" # rtrim quotes
+    case "$key" in
+      IPV4ADDR)      address="$value" ;;
+      IPV4NETMASK)   netmask="$value" ;;
+      IPV4GATEWAY)   gateway="$value" ;;
+      IPV4BROADCAST) broadcast="$value" ;;
+      IPV4DNS0)      dns0="$value" ;;
+      IPV4DNS1)      dns1="$value" ;;
+    esac
+  done < /run/net-$interface.conf
+
+  if [ -z "$address" ]; then
+    do_render_failure "Empty address"
+    return 3
+  elif ! ip4_is_valid "$address"; then
+    do_render_failure "Invalid address '$address'"
+    return 4
+  elif [ -z "$netmask" ]; then
+    do_render_failure "Empty netmask"
+    return 5
+  elif ! netmask4_is_valid "$netmask"; then
+    do_render_failure "Invalid netmask $netmask"
+    return 6
+  elif [ -z "$gateway" ]; then
+    do_render_failure "Empty gateway"
+    return 7
+  elif ! ip4_is_valid "$gateway"; then
+    do_render_failure "Invalid gateway $gateway"
+    return 8
+  elif [ -z "$broadcast" ]; then
+#   do_render_failure "Empty broadcast"
+#   return 9
+    broadcast="+"
+  elif ! ip4_is_valid "$broadcast"; then
+    do_render_failure "Invalid broadcast $broadcast"
+    return 10
+  fi
+
+  if [ "$dns0" = "0.0.0.0" ]; then
+    dns0=""
+  fi
+
+  if [ "$dns1" = "0.0.0.0" ]; then
+    dns1=""
+  fi
+
+  rm -f \
+    /run/net-$interface.conf \
+    /tmp/$interface.dhcp.log \
+    /tmp/$interface.dhcp.err \
+    /tmp/$interface.dhcp.success \
+    /tmp/$interface.dhcp.failed
+
+  do_render_success "OK"
+}
+
+do_configure_interface() {
+
+  local dns metric netbits netcidr
+
+  do_render_action "Configure Network Interface $interface"
+
+  rm -f \
+    /tmp/$interface.up.log \
+    /tmp/$interface.up.err
+
+  metric=$( do_get_interface_metric "$interface" )
+
+  netbits=$( mask4_to_bits4 "$netmask" )
+  netcidr=$( cidr4_to_net4 "$address/$netbits" )
+
+  # noprefixroute
+
+  ip addr add "$address/$netbits" broadcast "${broadcast:-+}" dev "$interface" scope global        1>>/tmp/$interface.up.log 2>>/tmp/$interface.up.err
+  ip link set dev "$interface" up                                                                  1>>/tmp/$interface.up.log 2>>/tmp/$interface.up.err
+  ip route flush dev "$interface"                                                                  1>>/tmp/$interface.up.log 2>>/tmp/$interface.up.err
+  ip route add "$netcidr" dev "$interface" proto kernel scope link src "$address" metric "$metric" 1>>/tmp/$interface.up.log 2>>/tmp/$interface.up.err
+  ip route add default via "$gateway" dev "$interface" proto static metric "$metric"               1>>/tmp/$interface.up.log 2>>/tmp/$interface.up.err
+
+  if [ -e /proc/sys/net/ipv4/conf/$interface/rp_filter ]; then
+    echo 2 >/proc/sys/net/ipv4/conf/$interface/rp_filter 2>>/tmp/$interface.up.err ||:
+  fi
+
+  for dns in $dns0 $dns1; do
+    echo "nameserver $dns # $1" >> /etc/resolv.conf
+  done
+
+  if ! ip route get 1.1.1.1 dev "$interface" >/dev/null 2>&1; then
+    do_render_failure "NO ROUTE TO 1.1.1.1"
+    return 1
+  fi
+
+  rm -f \
+    /tmp/$interface.up.log \
+    /tmp/$interface.up.err
+
+  do_render_success "OK"
+}
+
+do_ping_host() { # $1 = tag $2 = title $3 = host $4 = limit (5 by default)
+
+  local pid= tag="$1" title="$2" host="$3" limit="${4:-5}"
+
+  do_render_begin "$title"
+
+  rm -f \
+    /tmp/$interface.$tag.success \
+    /tmp/$interface.$tag.failed
+
+  ping -n -q -c 1 -w $limit -I $interface $host >/dev/null 2>&1 &&
+    touch /tmp/$interface.$tag.success ||
+    touch /tmp/$interface.$tag.failed & pid=$!
+
+  while [ $limit -gt 0 ] && ! [ -f /tmp/$interface.$tag.success -o -f /tmp/$interface.$tag.failed ]; do
+    sleep 1
+    echo -e -n "."
+    title="$title."
+    limit=$(( limit - 1 ))
+  done
+
+  do_kill_pid $pid
+
+  do_render_end "$title"
+
+  if [ ! -f /tmp/$interface.$tag.success ]; then
+    do_render_warning "PING $host FAILED"
+    return 0
+  fi
+
+  rm -f \
+    /tmp/$interface.$tag.success \
+    /tmp/$interface.$tag.failed
+
+  do_render_success "OK"
+}
+
+do_test_lan_connectivity() {
+  do_ping_host lan "Local Network Connectivity" "$gateway"
+}
+
+do_test_wan_connectivity() {
+  do_ping_host wan "Internet Connectivity" 1.1.1.1 
+}
+
+do_test_dns_connectivity() {
+  do_ping_host dns "Domain Name Resolution" google.com
+}
+
+do_sync_time() {
+
+  local pid= limit=15 title="Sync Time"
+
+  local http_date=
+
+  do_render_begin "$title"
+
+  rm -f \
+    /tmp/timesync.log \
+    /tmp/timesync.err \
+    /tmp/timesync.success \
+    /tmp/timesync.failed
+
+  if ! ip route get 1.1.1.1 >/dev/null 2>&1; then
+    do_render_end "$title"
+    do_render_failure "NO ROUTE TO 1.1.1.1"
+    return 1
+  fi
+
+  wget -qSO- http://1.1.1.1/ 2>&1 | (
+    while read -r line; do
+      case "$line" in
+        [Dd][Aa][Tt][Ee]:*)
+          echo ${line#[Dd][Aa][Tt][Ee]:} && return 0
+          ;;
+        [Ww][Gg][Ee][Tt]:*)
+          echo "$line" >&2
+          ;;
+        '')
+          break
+          ;;
+      esac
+    done
+    return 1
+  ) >/tmp/timesync.log 2>/tmp/timesync.err &&
+    touch /tmp/timesync.success ||
+    touch /tmp/timesync.failed & pid=$!
+
+#  printf 'GET / HTTP/1.0\r\nHost: google.com\r\n\r\n' |
+#  nc -w $limit google.com 80 2>/tmp/timesync.err | (
+#    while IFS=' ' read -r line; do
+#      case "$line" in
+#        [Dd][Aa][Tt][Ee]:*)
+#          echo ${line#[Dd][Aa][Tt][Ee]:} && return 0
+#        ;;
+#      esac
+#    done
+#    return 1
+#  ) >/tmp/timesync.log && 
+#    touch /tmp/timesync.success ||
+#    touch /tmp/timesync.failed &
+
+  while [ $limit -gt 0 ] && ! [ -f /tmp/timesync.success -o -f /tmp/timesync.failed ]; do
+    sleep 1
+    echo -e -n "."
+    title="$title."
+    limit=$(( limit - 1 ))
+  done
+
+  do_kill_pid $pid
+
+  do_render_end "$title"
+
+  if [ ! -f /tmp/timesync.success ]; then
+    if [ -s /tmp/timesync.err ]; then
+      do_render_failure "HTTP REQUEST FAILED ($( cat /tmp/timesync.err | tr '\n' ' ' ))"
+    else
+      do_render_failure "HTTP REQUEST FAILED"
+    fi
+    return 2
+  elif [ ! -s /tmp/timesync.log ] || ! read -r http_date < /tmp/timesync.log 2>/dev/null || [ -z "$http_date" ]; then
+    do_render_failure "READ ERROR"
+    return 3
+  elif ! date -u -D "%a, %d %b %Y %H:%M:%S %Z" -s "$http_date" 2>/tmp/date.err >&2; then
+    do_render_failure "SET DATE FAILED"
+    return 4
+  fi
+
+  rm -f \
+    /tmp/timesync.log \
+    /tmp/timesync.err \
+    /tmp/timesync.success \
+    /tmp/timesync.failed
+
+  do_render_success "OK"
+}
+
+do_chroot_start() {
+
+  local exit_status=0 lang= hostname= home=
+
+  do_clear_screen
+
+  if do_system_partitions_up; then
+
+    if do_chroot_up; then
+
+      if ! LANG=${lang:-C.UTF-8} HOSTNAME=${hostname:-debian} HOME=${home:-/root} PWD=${home:-/root} SHELL=/bin/bash unshare --uts chroot /mnt /bin/bash -c 'hostname "$HOSTNAME";cd "$HOME";bash -i'; then
+
+        exit_status=$?
+
+      fi
+
+    fi
+
+    do_chroot_down
+
+    do_system_partitions_down
+
+  else
+
+    case "$?" in
+      1) return 0 ;; # key input aborted
+      2) : ;;        # wrong key
+      *) do_system_partitions_down ;;
+    esac
+
+  fi
+
+  if [ "$exit_status" -ne 0 ]; then
+    do_render_warning "The chroot exit status is '$exit_status'"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_chroot_with_sshd_start() {
+
+  local exit_status=0 lang= hostname= home=
+
+  do_clear_screen
+
+  if do_system_partitions_up; then
+
+    if do_chroot_up; then
+
+      if ! LANG=${lang:-C.UTF-8} HOSTNAME=${hostname:-debian} HOME=${home:-/root} PWD=${home:-/root} SHELL=/bin/bash unshare --uts chroot /mnt /bin/bash -c 'hostname "$HOSTNAME";cd "$HOME";$(which sshd) -f /etc/ssh/sshd_config -p 1337 -E /tmp/sshd.log 2>/tmp/sshd.err >&2;bash -i'; then
+
+        exit_status=$?
+
+      fi
+
+    fi
+
+    do_chroot_down
+
+    do_system_partitions_down
+
+  else
+
+    case "$?" in
+      1) return 0 ;; # key input aborted
+      2) : ;;        # wrong key
+      *) do_system_partitions_down ;;
+    esac
+
+  fi
+
+  if [ "$exit_status" -ne 0 ]; then
+    do_render_warning "The chroot exit status is '$exit_status'"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_get_device_path() {
+  case "$1" in
+    *=*) blkid --output device --list-one --match-token "$1" 2>/dev/null || return 1 ;;
+      *) blkid --output device "$1" 2>/dev/null || return 1 ;;
+  esac
+}
+
+do_get_fstype() {
+  case "$1" in
+    *=*) blkid --output value --match-tag TYPE --list-one --match-token "$1" 2>/dev/null || return 1 ;;
+      *) blkid --output value --match-tag TYPE "$1" 2>/dev/null || return 1 ;;
+  esac
+}
+
+do_get_vgname() { # $1 = pvname ( /dev/mapper/crypto-disk )
+  lvm pvs --noheading -o vgname "$1" | {
+    local vgname=
+    if read -r vgname; then
+      echo $vgname && return 0
+    fi
+    return 1
+  }
+}
+
+findmnt() { # $1 = device path or mount point
+  local device= mount_point= fstype= options= rest=
+  while read -r device mount_point fstype options rest; do
+    if [ "$1" = "$device" -o "$1" = "$mount_point" ]; then
+      return 0
+    fi
+  done < /proc/mounts
+  return 1
+}
+
+do_system_partitions_up() {
+
+  local chroot=/mnt
+  local pv_name=/dev/mapper/$TARGET
+  local vg_name=
+  local stderr=
+  local input=
+
+  if [ -z "$KEY" ]; then
+    do_request_key_or_passphrase || return 1
+  fi
+
+  if [ -b $pv_name ]; then
+    do_render_warning "WARNING: The physical volume '$pv_name' already exists, which implies that '$DEV' is already unlocked"
+  elif ! stderr=$( do_cat_key "${KEY:-$input}" | cryptsetup luksOpen --batch-mode --key-file=- $DEV $TARGET 2>&1 ); then
+    do_render_failure "FAILURE: ${stderr:-cryptsetup luksOpen --key-file=- $DEV $TARGET}"
+    return 2
+  elif [ ! -b $pv_name ]; then
+    do_render_failure "FAILURE: The physical volume '$pv_name' was not found"
+    return 3
+  fi
+
+  if ! vg_name=$( do_get_vgname $pv_name ) || [ -z "$vg_name" ]; then
+    do_render_failure "FAILURE: The volume group name of the physical volume '$pv_name' was not found"
+    return 4
+  elif [ -d "/dev/$vg_name" ]; then
+    : # echo "WARNING: The volume group '$vg_name' already exists, which implies that is already activated"
+  elif ! stderr=$( vgchange --quiet --activate y $vg_name 2>&1 ); then
+    do_render_failure "FAILURE: ${stderr:-vgchange --activate y $vg_name}"
+    return 5
+  fi
+
+  if [ -d $chroot ]; then
+    echo "WARNING: The mount point '$chroot' already exists"
+  elif ! mkdir -p $chroot; then
+    do_render_failure "FAILURE: mkdir -p $chroot"
+    return 6
+  fi
+
+  if [ -z "$ROOT" ]; then
+    do_render_failure "FAILURE: The environment variable 'ROOT' is empty, check your kernel cmdline!"
+    return 7
+  elif ! ROOTDEV=$( do_get_device_path $ROOT ) || [ -z "$ROOTDEV" ]; then
+    do_render_failure "FAILURE: The device path of '$ROOT' could not be determinated"
+    return 8
+  elif ! ROOTFSTYPE=$( do_get_fstype $ROOTDEV ) || [ -z "$ROOTFSTYPE" ]; then
+    do_render_warning "WARNING: The file system of '$ROOTDEV' could not be determinated, will use 'auto'"
+  fi
+
+  if findmnt $ROOTDEV; then
+    do_render_warning "WARNING: The device '$ROOTDEV' is already mounted"
+  elif ! mount -t ${ROOTFSTYPE:-auto} -o ${ROOTFLAGS:-defaults,noatime,errors=remount-ro} $ROOTDEV $chroot; then
+    do_render_failure "FAILURE: mount -t ${ROOTFSTYPE:-auto} -o ${ROOTFLAGS:-defaults,noatime,errors=remount-ro} $ROOTDEV $chroot"
+    return 9
+  fi
+
+  local file_system= mount_point= fstype= options= dump= pass= blkdevpath=
+
+  while read -r file_system mount_point fstype options dump pass || [ -n "$file_system$mount_point$fstype$options$dump$pass" ]; do
+
+    case "$file_system,$mount_point,$fstype,$options,$dump,$pass" in
+      *'#'*|*,,*) continue ;; # skip comments and empty lines
+    esac
+
+    case "$options" in
+      *_netdev*|*noauto*) continue ;; # skip _netdev and noauto
+    esac
+
+    if ! blkdevpath=$( do_get_device_path "$file_system" ) || [ -z "$blkdevpath" ]; then
+      do_render_warning "WARNING: The device path of '$file_system' could not be determinated, continue anyway"
+    elif [ ! -d "${chroot}${mount_point}" ]; then
+      do_render_warning "WARNING: The mount point '$mount_point' of '$file_system' does not exist, continue anyway"
+    elif [ "$mount_point" = "/" ] && ! mount -o remount,$options "${chroot}${mount_point}"; then
+      do_render_warning "WARNING: mount -o remount,$options '${chroot}${mount_point}' failed, continue anyway"
+    elif [ "$mount_point" != "/" ] && findmnt $blkdevpath; then
+      do_render_warning "WARNING: The device '$blkdevpath' is already mounted, continue anyway"
+    elif [ "$mount_point" != "/" ] && ! mount -t $fstype -o $options $blkdevpath "${chroot}${mount_point}"; then
+      do_render_warning "WARNING: mount -t $fstype -o $options $blkdevpath '${chroot}${mount_point}' failed, continue anyway"
+    fi
+
+  done < $chroot/etc/fstab
+
+}
+
+do_system_partitions_down() {
+
+  local chroot=/mnt
+  local pv_name=/dev/mapper/$TARGET
+  local vg_name=
+  local stderr=
+
+  local device= mount_point= fstype= options= dump= pass=
+
+  sync
+
+  while read -r device mount_point fstype options dump pass; do
+    if [ -n "${mount_point##$chroot/*}" ]; then 
+      : # mount point is not within chroot
+    elif ! umount $mount_point; then
+      echo "WARNING: umount $mount_point failed, continue anyway"
+      umount -lf $mount_point
+    fi
+  done < /proc/mounts
+
+  if [ -z "$ROOT" ]; then
+    do_render_warning "WARNING: The environment variable 'ROOT' is empty, check your kernel cmdline!"
+  elif ! ROOTDEV=$( do_get_device_path $ROOT ) || [ -z "$ROOTDEV" ]; then
+    do_render_warning "WARNING: The device path of '$ROOT' could not be determinated"
+  fi
+
+  if ! findmnt $chroot; then
+    do_render_warning "WARNING: The device '$ROOTDEV' is not mounted, continue anyway"
+  elif ! umount $chroot; then
+    do_render_warning "WARNING: umount $chroot failed, continue anyway"
+    umount -lf $chroot
+  fi
+
+  if [ ! -d $chroot ]; then
+    do_render_warning "WARNING: The mount point '$chroot' does not exists, continue anyway"
+  elif ! rmdir $chroot; then
+    do_render_warning "WARNING: rmdir $chroot failed, continue anyway"
+  fi
+
+  if ! vg_name=$( do_get_vgname $pv_name ) || [ -z "$vg_name" ]; then
+    do_render_warning "WARNING: The volume group name of the physical volume '$pv_name' was not found, continue anyway"
+  elif [ ! -d "/dev/$vg_name" ]; then
+    do_render_warning "WARNING: The volume group '$vg_name' does not exist, which implies that was already deactivated"
+  elif ! stderr=$( vgchange --quiet --activate n $vg_name 2>&1 ); then
+    do_render_warning "WARNING: ${stderr:-vgchange --activate n $vg_name failed, continue anyway}"
+  fi
+
+  if [ ! -b $pv_name ]; then
+    do_render_warning "WARNING: The physical volume '$pv_name' does not exists, which implies that '$DEV' was already locked"
+  elif ! stderr=$( cryptsetup luksClose --batch-mode $TARGET 2>&1 ); then
+    do_render_warning "WARNING: ${stderr:-cryptsetup luksClose --verbose $TARGET failed, continue anyway}"
+  fi
+
+}
+
+get_total_mem() {
+
+  local key= value= unit=
+
+  if ! read -r key value unit < /proc/meminfo; then
+    return 1
+  elif [ "$key$unit" != "MemTotal:kB" ]; then
+    return 2
+  elif [ -z "${value##*[!0-9]*}" ]; then
+    return 3
+  fi
+
+  echo $(( value * 1024 ))
+
+}
+
+has_total_mem() { # $1 = minimum total memory in bytes
+  [ "$( get_total_mem || echo 0 )" -ge ${1:-0} ]
+}
+
+do_chroot_up() {
+
+  local chroot=/mnt
+  local directory=
+  local args=
+  local tmp=
+
+  if has_total_mem 2147483648; then
+    tmp='/tmp /var/tmp'
+  fi
+
+  for directory in /run /dev /dev/pts /proc /sys $tmp; do
+
+    case "$directory" in
+      /run)     args="-o bind /run" ;;
+      /dev)     args="-o bind /dev" ;;
+      /dev/pts) args="-o bind /dev/pts" ;;
+      /proc)    args="-t proc proc" ;;
+      /sys)     args="-t sysfs sys" ;;
+      /tmp)     args="-t tmpfs tmpfs -o mode=1777,nosuid,nodev" ;;
+      /var/tmp) args="-t tmpfs tmpfs -o mode=1777,nosuid,nodev" ;;
+    esac
+
+    if findmnt "${chroot}${directory}"; then
+      do_render_warning "WARNING: The mount point '$directory' is already mounted, continue anyway"
+    elif ! mount $args "${chroot}${directory}"; then
+      do_render_warning "WARNING: mount $args ${chroot}${directory} failed, continue anyway"
+    fi
+
+  done
+
+  # backup $chroot/etc/resolv.conf
+  if [ -L "$chroot/etc/resolv.conf" ] || [ -e "$chroot/etc/resolv.conf" ]; then
+    mv "$chroot/etc/resolv.conf" "$chroot/etc/resolv.conf.initramfs-admin"
+  fi
+
+  # create $chroot/etc/resolv.conf
+  if [ -e /etc/resolv.conf ]; then
+    cat /etc/resolv.conf > "$chroot/etc/resolv.conf"
+  else
+    echo "nameserver 8.8.8.8 # initramfs-admin"  > "$chroot/etc/resolv.conf"
+    echo "nameserver 8.8.4.4 # initramfs-admin" >> "$chroot/etc/resolv.conf"
+  fi
+
+  # check $chroot/etc/mtab
+  if [ `readlink "$chroot/etc/mtab"` != '../proc/self/mounts' ]; then
+    do_render_warning "WARNING: $chroot/etc/mtab does not link to ../proc/self/mounts, fixing it"
+    ln -fnTsv '../proc/self/mounts' "$chroot/etc/mtab"
+  fi
+
+  # prevent services from being started
+  if [ -L "$chroot/sbin/initctl" ] || [ -e "$chroot/sbin/initctl" ]; then
+    if [ ! -L "$chroot/sbin/initctl.initramfs-admin" ] && [ ! -e "$chroot/sbin/initctl.initramfs-admin" ]; then
+      mv "$chroot/sbin/initctl" "$chroot/sbin/initctl.initramfs-admin"
+    fi
+    if [ -x "$chroot/usr/bin/true" ]; then
+      ln -fnTsv "/usr/bin/true" "$chroot/sbin/initctl"
+    elif [ -x "$chroot/bin/true" ]; then
+      ln -fnTsv "/bin/true" "$chroot/sbin/initctl"
+    fi
+  fi
+
+  # prevent services from being started
+  echo "#!/bin/sh" > "$chroot/usr/sbin/policy-rc.d"
+  echo "exit 101" >> "$chroot/usr/sbin/policy-rc.d"
+  chmod 0755 "$chroot/usr/sbin/policy-rc.d"
+
+  # detect chroot $LANG
+  if [ -s "$chroot/etc/default/locale" ]; then
+    local line= quotes="'\""
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        LANG=*)
+          line="${line%%#*}" # strip comment
+          lang="${line#LANG=}" # extract value
+          lang="${lang#"${lang%%[!$quotes]*}"}" # ltrim quotes
+          lang="${lang%"${lang##*[!$quotes]}"}" # rtrim quotes
+          ;;
+      esac
+    done < "$chroot/etc/default/locale"
+  fi
+
+  # detect chroot $HOSTNAME
+  if [ -s "$chroot/etc/hostname" ]; then
+    read -r hostname < "$chroot/etc/hostname" ||: # may return 1 if newline is missing
+  fi
+
+  # detect chroot $HOME
+  if [ -s "$chroot/etc/passwd" ]; then
+    home=$( grep '^root:' "$chroot/etc/passwd" | cut -f6 -d: )
+  fi
+
+  return 0
+}
+
+do_chroot_down() {
+
+  local chroot=/mnt
+  local directory=
+  local signal=
+  local proc=
+  local pids=
+  local pid=
+  local tmp=
+
+  for signal in TERM KILL; do
+    for directory in /proc/*/root; do
+      if [ "$(readlink $directory)" = "$chroot" ]; then
+        proc="${directory%/*}"
+        pids="${pids:+$pids }${proc##*/}"
+      fi
+    done
+    if [ -z "$pids" ]; then
+      break
+    fi
+    echo
+    echo " Trying to $signal still running processes..."
+    echo
+    for pid in $pids; do
+      printf ' %5.5s    %s\n' "$pid" "$( cat /proc/$pid/cmdline 2>/dev/null | tr '\0\n' ' ' )"
+    done
+    echo
+    echo " Running kill -$signal $pids"
+    echo
+    kill -$signal $pids
+    echo
+    echo " Done!"
+    echo
+    pids=
+    sleep 2
+  done
+
+  if has_total_mem 2147483648; then
+    tmp='/tmp /var/tmp'
+  fi
+
+  for directory in $tmp /sys /proc /dev/pts /dev /run; do
+    if ! findmnt "${chroot}${directory}"; then
+      do_render_warning "WARNING: The directory '$directory' is not mounted, continue anyway"
+    elif ! umount "${chroot}${directory}"; then
+      do_render_warning "WARNING: umount ${chroot}${directory} failed, continue anyway"
+      umount -lf "${chroot}${directory}"
+    fi
+  done
+
+  if [ -L "$chroot/etc/resolv.conf.initramfs-admin" ] || [ -e "$chroot/etc/resolv.conf.initramfs-admin" ]; then
+    mv "$chroot/etc/resolv.conf.initramfs-admin" "${chroot}/etc/resolv.conf"
+  fi
+
+  if [ -L "$chroot/sbin/initctl.initramfs-admin" ] || [ -e "$chroot/sbin/initctl.initramfs-admin" ]; then
+    mv "$chroot/sbin/initctl.initramfs-admin" "$chroot/sbin/initctl"
+  fi
+
+  rm -f "$chroot/usr/sbin/policy-rc.d"
+
+  sleep 2
+}
+
+do_reboot() {
+
+  do_clear_screen
+
+  echo ""
+  echo -n " Reboot"
+  sleep 1
+  echo -n "."
+  sleep 1
+  echo -n "."
+  sleep 1
+  echo -n "."
+
+  reboot
+
+  sleep 1
+
+  echo
+  echo
+
+  do_render_warning "Reboot failed"
+
+  do_press_enter_to_continue
+}
+
+do_poweroff() {
+
+  do_clear_screen
+
+  echo ""
+  echo -n " Poweroff"
+  sleep 1
+  echo -n "."
+  sleep 1
+  echo -n "."
+  sleep 1
+  echo -n "."
+
+  poweroff
+
+  sleep 1
+
+  echo
+  echo
+
+  do_render_warning "Poweroff failed"
+
+  do_press_enter_to_continue
+}
+
+do_busybox_start() {
+
+  do_clear_screen
+
+  sh -i
+}
+
+do_mc_start() {
+
+  do_clear_screen
+
+  mc
+}
+
+do_lynx_start() {
+
+  do_clear_screen
+
+  lynx -accept_all_cookies -use_mouse http://google.com/
+
+#-cfg=/dev/stdin
+# << CFG
+#FORCE_SSL_PROMPT:NO
+#CFG
+}
+
+do_nano_start() {
+
+  do_clear_screen
+
+  nano
+}
+
+do_htop_start() {
+
+  do_clear_screen
+
+  htop
+}
+
+do_sshd_start() {
+
+  local limit=5 title="Starting SSH server"
+
+  do_clear_screen
+
+  do_render_header "SSH SERVER"
+
+  do_render_begin "$title"
+
+  if do_sshd_check_running; then
+    do_render_end "$title"
+    do_render_warning "The SSHD daemon is already running"
+    do_press_enter_to_continue
+    return 0
+  fi
+
+  rm -f /run/sshd.log /run/sshd.err /run/sshd.pid
+
+  if ! $(which sshd) -f /etc/ssh/sshd_config -p "$sshd_port" -E /run/sshd.log 2>/run/sshd.err >&2; then
+    do_render_end "$title"
+    do_render_failure "The SSHD daemon failed with exit code '$?'"
+    do_press_enter_to_continue
+    return 1
+  elif [ ! -s /run/sshd.pid ]; then
+    # Unfortunately, SSHD uses poor logic which occasionally results in the daemon forking before the .pid file is written :(
+    # Best solution to overcome this wobbly implementation is to sleep a second, and check again
+    sleep 1
+    if [ ! -s /run/sshd.pid ]; then
+      do_render_end "$title"
+      do_render_failure "The SSHD daemon started successful, but the pid file /run/sshd.pid does not exist"
+      do_press_enter_to_continue
+      return 2
+    fi
+  fi
+
+  while [ $limit -gt 0 ] && do_sshd_check_running && ! do_get_sshd_listening_port >/dev/null; do
+    sleep 1
+    echo -e -n "."
+    title="$title."
+    limit=$(( limit - 1 ))
+  done
+
+  do_render_end "$title"
+
+  if ! do_sshd_check_running; then
+    do_render_failure "The SSHD daemon has stopped"
+    do_press_enter_to_continue
+    return 3
+  elif ! do_get_sshd_listening_port >/dev/null; then
+    do_render_failure "The SSHD daemon listening port was not found"
+    do_press_enter_to_continue
+    return 4
+  fi
+
+  do_render_success "OK"
+  do_press_enter_to_continue
+}
+
+do_sshd_stop() {
+
+  local limit=5 title="Stopping SSH server"
+
+  do_clear_screen
+
+  do_render_header "SSH SERVER"
+
+  do_render_begin "$title"
+
+  if ! do_sshd_check_running; then
+    do_render_end "$title"
+    do_render_warning "The SSHD daemon is not running"
+    do_press_enter_to_continue
+    return 0
+  fi
+
+  do_sshd_kill &
+
+  while [ $limit -gt 0 ] && do_sshd_check_running; do
+    sleep 1
+    echo -e -n "."
+    title="$title."
+    limit=$(( limit - 1 ))
+  done
+
+  do_render_end "$title"
+
+  if do_sshd_check_running; then
+    do_render_failure "The SSHD daemon is still running"
+    do_press_enter_to_continue
+    return 3
+  fi
+
+  do_render_success "OK"
+  do_press_enter_to_continue
+}
+
+do_sshd_status() {
+
+  do_clear_screen
+
+  if [ ! -f /run/sshd.log ]; then
+    do_render_failure "Log file does not exist"
+    do_press_enter_to_continue
+    return 0
+  fi
+
+  tail -n 20 -s 1 -f /run/sshd.log /run/sshd.err
+}
+
+do_sshd_change_listening_port() {
+
+  local input= abort=
+
+  echo ""
+  echo -e -n " PORT NUMBER: \033[1;36m"
+  read -r input || abort=1
+  echo -e -n "\033[0m"
+
+  if [ -z "$input" -o -n "$abort" ]; then
+    return 0
+  elif [ -z "${input##*[!0-9]*}" ] || [ "$input" -lt 0 -o "$input" -gt 65535 ]; then
+    do_render_failure "Invalid port number: $input"
+    do_press_enter_to_continue
+  else
+    sshd_port="$input"
+  fi
+}
+
+do_sshd_edit_authorized_keys() {
+  nano "$HOME/.ssh/authorized_keys"
+}
+
+do_render_sshd_status() {
+
+  local listening_port=
+
+  if ! listening_port=$( do_get_sshd_listening_port ); then
+    echo -e " SSHD: \033[1;33mNOT RUNNING\033[0m"
+  else
+    echo -e " SSHD: \033[1;32mRUNNING [PORT: $listening_port]\033[0m"
+  fi
+}
+
+do_get_sshd_listening_port() {
+
+  local sl= l_addr= l_port= r_addr= r_port= st= tx_queue= rx_queue= tr= tm_when= retrnsmt= uid= timeout= inode= rest= comm= path=
+
+  while IFS=":$IFS" read -r sl l_addr l_port r_addr r_port st tx_queue rx_queue tr tm_when retrnsmt uid timeout inode rest; do
+    if [ "$st" = "0A" ]; then
+      path=$( find -L /proc/*/fd/* -maxdepth 0 -inum $inode 2>/dev/null || true )
+      if [ "$( cat ${path%/*/*}/comm 2>/dev/null )" = "sshd" ]; then
+        echo $(( 0x$l_port )) && return 0
+      fi
+    fi
+  done < /proc/net/tcp
+
+  return 1
+
+}
+
+do_sshd_check_running() {
+  do_sshd_pid_get >/dev/null
+}
+
+do_sshd_pid_get() {
+  do_read_pid_file sshd /run/sshd.pid
+}
+
+do_sshd_kill() {
+  do_kill_pid_file sshd /run/sshd.pid
+}
+
+do_render_network_manager() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "NETWORK MANAGER"
+
+    do_render_battery_status
+    do_render_network_status
+    echo ""
+    echo " 1) LAN UP"
+    echo " 2) LAN DOWN"
+    echo " 3) LAN CONFIG"
+    echo " 4) LAN STATUS"
+    echo ""
+    echo " 5) WLAN UP"
+    echo " 6) WLAN DOWN"
+    echo " 7) WLAN CONFIG"
+    echo " 8) WLAN STATUS"
+    echo ""
+    echo " R) RESOLV CONF"
+    echo " S) SYNC TIME"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case $input in
+      1) do_interface_up      lan ;;
+      2) do_interface_down    lan ;;
+      3) do_interface_config  lan ;;
+      4) do_interface_status  lan ;;
+      5) do_interface_up     wlan ;;
+      6) do_interface_down   wlan ;;
+      7) do_interface_config wlan ;;
+      8) do_interface_status wlan ;;
+    R|r) nano /etc/resolv.conf ;;
+    S|s) clear ; do_render_header "SYNC TIME" ; do_sync_time ; do_press_enter_to_continue ;;
+    B|b) break ;;
+    esac
+
+  done
+}
+
+do_type_uppercase_yes_to_continue() { # $1 = message $2 = errmsg
+
+  local input=
+
+  echo -e -n " ${1:-Type uppercase \033[1;36mYES\033[0m to continue}: \033[1;36m"
+  read input
+  echo -e -n "\033[0m"
+  echo ""
+
+  if [ "$input" != "YES" ]; then
+    do_render_notice "${2:-You did not type YES, operation aborted!}"
+    do_press_enter_to_continue
+    return 1
+  fi
+}
+
+do_luks_key_add() {
+
+  local keypipe=/tmp/keypipe
+
+  local input=
+
+  local pid=
+
+  local keytype_new=
+
+  local new_passphrase=
+  local new_passphrase_again=
+
+  local stderr=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "KEY SLOT ${key_slot}"
+
+  echo -e " \033[1;33mWARNING: You are about to add a new passphrase in key slot $key_slot.\033[0m"
+  echo ""
+  echo -e " \033[1;35mWARNING: The keyboard layout at the computer start is english!\033[0m"
+  echo ""
+  echo ""
+
+  do_type_uppercase_yes_to_continue || return 0
+
+  do_request_key_or_passphrase "Enter the new passphrase or uuencoded key for key slot $key_slot:" || return $?
+  new_passphrase="$input"
+
+  if input_is_uuencoded "$input"; then
+    keytype_new=key
+    new_passphrase_again="$new_passphrase"
+  else
+    keytype_new=passphrase
+    do_request_key_or_passphrase "Enter the new passphrase or uuencoded key for key slot $key_slot again:" || return $?
+    new_passphrase_again="$input"
+  fi
+
+  if [ -z "$KEY" ]; then
+
+    do_request_key_or_passphrase || return $?
+
+    rm -f $keypipe
+    mkfifo -m 0600 $keypipe
+    do_cat_key "$input" >$keypipe & pid=$!
+
+  fi
+
+  if [ -z "$new_passphrase" ]; then
+    do_render_failure "The new $keytype_new is empty"
+  elif [ "$new_passphrase" != "$new_passphrase_again" ]; then
+    do_render_failure "The new $keytype_new and the repetition do not match"
+  elif ! stderr=$( do_cat_key "$new_passphrase" | cryptsetup luksAddKey --batch-mode --iter-time=${iter_time:-2000} --key-file=${KEY:-$keypipe} --key-slot=$key_slot $DEV - 2>&1 ); then
+    do_render_failure "${stderr:-cryptsetup failed to add the new key}"
+  else
+    do_render_success "The new $keytype_new was successfully added to key slot $key_slot"
+  fi
+
+  [ -z "$pid" ] ||
+  kill -KILL $pid 2>/dev/null
+
+  rm -f $keypipe
+
+  do_press_enter_to_continue
+}
+
+do_luks_key_modify() {
+
+  local keypipe=/tmp/keypipe
+
+  local input=
+
+  local pid=
+
+  local keytype_new=
+
+  local old_passphrase=
+  local new_passphrase=
+  local new_passphrase_again=
+
+  local stderr=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "KEY SLOT ${key_slot}"
+
+  echo -e " \033[1;33mWARNING: You are about to modify the passphrase in key slot $key_slot.\033[0m"
+  echo ""
+  echo -e " \033[1;35mWARNING: The keyboard layout at the computer start is english!\033[0m"
+  echo ""
+  echo ""
+
+  do_type_uppercase_yes_to_continue || return 0
+
+  do_request_key_or_passphrase "Enter the new passphrase or uuencoded key for key slot $key_slot:" || return $?
+  new_passphrase="$input"
+
+  if input_is_uuencoded "$input"; then
+    keytype_new=key
+    new_passphrase_again="$new_passphrase"
+  else
+    keytype_new=passphrase
+    do_request_key_or_passphrase "Enter the new passphrase or uuencoded key for key slot $key_slot again:" || return $?
+    new_passphrase_again="$input"
+  fi
+
+  do_request_key_or_passphrase "Enter the current passphrase or uuencoded key of key slot $key_slot:" || return $?
+  old_passphrase="$input"
+
+  rm -f $keypipe
+  mkfifo -m 0600 $keypipe
+  do_cat_key "$old_passphrase" >$keypipe & pid=$!
+
+  if [ -z "$new_passphrase" ]; then
+    do_render_failure "The new $keytype_new is empty"
+  elif [ "$new_passphrase" != "$new_passphrase_again" ]; then
+    do_render_failure "The new $keytype_new and the repetition do not match"
+  elif stderr=$( ! do_cat_key "$new_passphrase" | cryptsetup luksChangeKey --batch-mode --iter-time=${iter_time:-2000} --key-file=$keypipe --key-slot=$key_slot $DEV - 2>&1 ); then
+    do_render_failure "${stderr:-cryptsetup failed to change the current key}"
+  else
+    do_render_success "The new $keytype_new was successfully added to key slot $key_slot"
+  fi
+
+  [ -z "$pid" ] ||
+  kill -KILL $pid 2>/dev/null
+
+  rm -f $keypipe
+
+  do_press_enter_to_continue
+}
+
+do_luks_kill_slot() {
+
+  local input=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "KEY SLOT ${key_slot}"
+
+  echo -e " \033[1;33mWARNING: You are about to kill key slot $key_slot.\033[0m"
+  echo ""
+  echo -e " \033[1;31mWARNING: The key slot will be killed without any further prompt!\033[0m"
+  echo ""
+  echo ""
+
+  do_type_uppercase_yes_to_continue || return 0
+
+  if ! stderr=$( cryptsetup luksKillSlot --batch-mode $DEV $key_slot 2>&1 ); then
+    do_render_failure "${stderr:-cryptsetup failed to kill key slot $key_slot}"
+  else
+    do_render_success "Key slot $key_slot was successfully killed"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_luks_key_verify() {
+
+  local input=
+  local keytype=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "KEY SLOT ${key_slot}"
+
+  do_request_key_or_passphrase "Enter the current passphrase or uuencoded key of key slot $key_slot:" || return $?
+
+  if input_is_uuencoded "$input"; then
+    keytype=key
+  else
+    keytype=passphrase
+  fi
+
+  if ! do_cat_key "$input" | cryptsetup luksOpen --batch-mode --test-passphrase --key-file=- --key-slot $key_slot $DEV 2>/dev/null; then
+    do_render_failure "The $keytype is not correct"
+  else
+    do_render_success "The $keytype is correct"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_render_keyslot_manager() {
+
+  local input= status=
+
+  while true; do
+
+    do_import_crypto_properties "$DEV"
+
+    case "$key_slot" in
+      0) status="$key_slot_0" ;;
+      1) status="$key_slot_1" ;;
+      2) status="$key_slot_2" ;;
+      3) status="$key_slot_3" ;;
+      4) status="$key_slot_4" ;;
+      5) status="$key_slot_5" ;;
+      6) status="$key_slot_6" ;;
+      7) status="$key_slot_7" ;;
+    esac
+
+    do_clear_screen
+
+    do_render_header "CRYPTO MANAGER" "KEY SLOT ${key_slot}"
+
+    if [ "$status" = "DISABLED" ]; then
+    echo " A) ADD PASSPHRASE OR KEY FILE"
+    else ###################################
+    echo " M) MODIFY PASSPHRASE OR KEY FILE"
+    echo " V) VERIFY PASSPHRASE OR KEY FILE"
+    echo " K) KILL KEY SLOT"
+    fi
+
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    if [ "$status" = "DISABLED" ]; then
+      case "$input" in
+        A|a) do_luks_key_add ;;
+        B|b) break ;;
+      esac
+    else
+      case "$input" in
+        M|m) do_luks_key_modify ;;
+        V|v) do_luks_key_verify ;;
+        K|k) do_luks_kill_slot ;;
+        B|b) break ;;
+      esac
+    fi
+
+  done
+}
+
+do_change_default_iter_time() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "CRYPTO MANAGER" "ITER TIME"
+
+    echo -e " \033[1;33mThe iteration time determines how much time is needed to validate a \033[0m"
+    echo -e " \033[1;33mpassphrase. The higher the iteration time the harder the passphrase is to \033[0m"
+    echo -e " \033[1;33mcrack. A high iteration time delays the boot process accordingly. The \033[0m"
+    echo -e " \033[1;33miteration time only affects new passphrases but NOT existing passphrases.\033[0m"
+
+    echo ""
+    echo ""
+
+    echo -e -n " Enter the iteration time in milliseconds (1 - 60000) [\033[1;36m${iter_time:-2000}ms\033[0m]: \033[1;36m"
+    read -r input
+    echo -e -n "\033[0m"
+
+    echo ""
+    echo ""
+
+    if [ -z "$input" ]; then
+      return 0
+    elif [ -z "${input##*[!0-9]*}" ]; then
+      echo -e " \033[1;31mINPUT IS NOT NUMERIC\033[0m"
+    elif [ $input -lt 1 ] || [ $input -gt 60000 ]; then
+      echo -e " \033[1;31mINPUT IS OUT OF RANGE\033[0m"
+    else
+      iter_time=$input
+      return 0
+    fi
+
+    sleep 2
+
+  done
+}
+
+do_change_passphrase_visibility() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "CRYPTO MANAGER" "SHOW PASSPHRASES"
+
+    echo -e " \033[1;33mThis setting determines whether passphrases are displayed\033[0m"
+    echo -e " \033[1;33mduring input or not.\033[0m"
+    echo ""
+    echo -e " \033[1;33mThis affects only passphrases in this tool.\033[0m"
+    echo ""
+    echo ""
+    echo " Y) YES"
+    echo " N) NO"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case $input in
+      Y|y) key_read_opts= ;;
+      N|n) key_read_opts=-s ;;
+      B|b) return 0 ;;
+        *) continue ;;
+    esac
+
+    return 0
+
+  done
+}
+
+do_get_device_name() { # $1 = devpath or devname
+
+  local part_path= disk_path= disk_name= filename= vendor= model=
+
+  local dev_name="${1##*/}"
+
+  if [ ! -e "/sys/class/block/$dev_name/subsystem/" ] || [ "$( readlink -f /sys/class/block/$dev_name/subsystem/ )" != "/sys/class/block" ]; then
+    return 1 # not a block device
+  fi
+
+  if [ -e "/sys/class/block/$dev_name/partition" ]; then
+
+    part_path=$(readlink -f "/sys/class/block/$dev_name" 2>/dev/null)
+
+    disk_path="${part_path%/*}"
+
+  elif [ -e "/sys/class/block/$dev_name/size" ]; then
+
+    disk_path=$(readlink -f "/sys/class/block/$dev_name" 2>/dev/null)
+
+  fi
+
+  if [ -z "$disk_path" ]; then
+    return 1 # bad device
+  fi
+
+  disk_name="${disk_path##*/}"
+
+  for filename in vendor name; do
+    if [ ! -e "/sys/block/$disk_name/device/$filename" ]; then
+      continue
+    elif ! read -r vendor < /sys/block/$disk_name/device/$filename 2>/dev/null; then
+      return 2 # read error
+    else
+      break
+    fi
+  done
+
+  for filename in model serial; do
+    if [ ! -e "/sys/block/$disk_name/device/$filename" ]; then
+      continue
+    elif ! read -r model < /sys/block/$disk_name/device/$filename 2>/dev/null; then
+      return 2 # read error
+    else
+      break
+    fi
+  done
+
+  printf '%s %s' "${vendor:-$disk_name}" "${model:-block device}"
+}
+
+do_shrink_to_min_size() {
+
+  local input= key=
+
+  local pv_dm_path=/dev/mapper/$TARGET
+
+  local part_name=${DEV##*/}
+  local part_num=$(cat /sys/class/block/$part_name/partition 2>/dev/null)
+  local part_start=$(cat /sys/class/block/$part_name/start 2>/dev/null)
+  local part_size=$(cat /sys/class/block/$part_name/size 2>/dev/null)
+  local part_path=$(readlink -f /sys/class/block/$part_name 2>/dev/null)
+  local part_size_mb=$(( $part_size / 2048 ))
+
+  local part_start_max=$(cat /sys/class/block/${part_name%[0-9]*}*/start | sort -n | tail -n1)
+
+  local disk_path=${part_path%/*}
+  local disk_name=${disk_path##*/}
+  local disk_size=$(cat /sys/block/$disk_name/size 2>/dev/null)
+  local disk_type=$(cat /sys/block/$disk_name/device/type 2>/dev/null)
+
+  local part_current_last_sector=$(( $part_start + $part_size - 1 ))
+  local part_maximum_last_sector=$(( $disk_size - 34 ))
+
+  local disk_free=$(( $part_maximum_last_sector - $part_current_last_sector ))
+  local disk_size_mb=$(( $disk_size / 2048 ))
+  local disk_free_mb=$(( $disk_free / 2048 ))
+
+  local part_detected_new_size= part_minimum_last_sector= part_released_mib= part_released_sector_count=
+
+  local luks_payload_offset= luks_payload_size=
+
+  local pv_dev_name= pv_dev_path= pv_dev_size=
+
+  local vg_ext_size= vg_name=
+
+  local pe_alloc_count= pe_released_count= pe_released_mib= pe_start=
+
+  local lv_dev_size= lv_dm_path= lv_ext_count= lv_ext_released= lv_mib_released= lv_name=
+
+  local fs_blk_count= fs_blk_free= fs_blk_released= fs_blk_size= fs_mib_released=
+
+  local new_fs_blk_count= new_fs_byt_size= new_lv_dev_size= new_lv_ext_count= new_part_dev_size= new_part_sector_count= new_pe_alloc_count= new_pv_dev_size=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "SHRINK PARTITION"
+
+  echo -e " \033[1;33mWARNING: You are about to shrink the crypto partition:\033[0m"
+  echo ""
+  echo -e " \033[1;35m${DEV}\033[0m \033[1;34m(${part_size_mb} MiB)\033[0m \033[1;33mon the device\033[0m"
+  echo ""
+  echo -e " \033[1;36m$( do_get_device_name $disk_name )\033[0m \033[1;34m(${disk_free_mb} MiB of ${disk_size_mb} MiB unallocated)\033[0m${disk_type:+ \033[1;37m[Type: ${disk_type}]\033[0m}"
+  echo ""
+  echo -e " \033[1;33mBy shrinking the partition it is possible to clone the disk\033[0m"
+  echo -e " \033[1;33mto a smaller device.\033[0m"
+  echo ""
+  echo -e " \033[1;31mDO NOT DO THIS WITHOUT PREVIOUS BACKUP!\033[0m"
+  echo ""
+  echo ""
+
+  do_type_uppercase_yes_to_continue || return 0
+
+  if [ -z "$KEY" ]; then
+    do_request_key_or_passphrase || return 0
+    key="$input"
+  fi
+
+(
+
+# set -x
+
+#####################################################################################################
+  if ! do_render_action "Open LUKS Crypto Container"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif [ -z "${part_num##*[!0-9]*}" ]; then
+    do_render_failure "PART_NUM NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $part_current_last_sector -gt $part_maximum_last_sector ]; then
+    do_render_failure "DISK IS TOO SMALL"
+#----------------------------------------------------------------------------------------------------
+  elif [ $part_start -ne $part_start_max ]; then
+    do_render_failure "PART_START NOT EQUAL PART_START_MAX"
+#----------------------------------------------------------------------------------------------------
+  elif [ ! -b "$pv_dm_path" ] && ! do_cat_key "${KEY:-$key}" | cryptsetup luksOpen --batch-mode --verbose --key-file=- $DEV $TARGET >&2; then
+    do_render_failure "FAILED"
+  elif [ ! -b "$pv_dm_path" ]; then
+    do_render_failure "PV_DM_PATH INVALID"
+#----------------------------------------------------------------------------------------------------
+# elif ! pv_dev_name=`dmsetup info --columns --noheadings --options blkdevname $pv_dm_path | sed 's/^\s*//g; s/\s*$//g' 2>/dev/null`; then
+#   do_render_failure "PV_DEV_NAME QUERY FAILED"
+# elif [ -z "$pv_dev_name" ]; then
+#   do_render_failure "PV_DEV_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+# elif ! pv_dev_path=`readlink -f $pv_dm_path` || [ -z "$pv_dev_path" ]; then
+#   do_render_failure "PV_DEV_PATH QUERY FAILED"
+# elif ! pv_dev_name="${pv_dev_path##*/}" || [ -z "$pv_dev_name" ]; then
+#   do_render_failure "PV_DEV_NAME QUERY FAILED"
+# elif ! pv_dev_size=`cat /sys/block/$pv_dev_name/size` || [ -z "$pv_dev_size" ]; then
+#   do_render_failure "PV_DEV_SIZE QUERY FAILED"
+# elif [ -z "${pv_dev_size##*[!0-9]*}" ]; then
+#   do_render_failure "PV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Activate LVM Logical Volumes"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r vg_name << LVM; then
+$( lvm pvs --noheading -o vgname $pv_dm_path )
+LVM
+    do_render_failure "VG_NAME QUERY FAILED"
+  elif [ -z "$vg_name" ]; then
+    do_render_failure "VG_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+  elif ! lvm vgchange --config 'backup {backup = 0 archive = 0}' --verbose --activate y $vg_name >&2; then
+    do_render_failure "FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_name << LVM; then
+$( lvm pvs --noheadings -o seg_le_ranges,lv_name --select "vgname = $vg_name" $pv_dm_path | cut -f2 -d: | sort -n | tail -n1 | tr -s ' ' | cut -f2 -d' ' )
+LVM
+    do_render_failure "LV_NAME QUERY FAILED"
+  elif [ -z "$lv_name" ]; then
+    do_render_failure "LV_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Checking File System"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r luks_payload_offset << CRYPTSETUP; then
+$( cryptsetup luksDump $DEV | grep -F 'Payload offset:' | tr -s ' ' '\t' | cut -f3 )
+CRYPTSETUP
+    do_render_failure "LUKS_PAYLOAD_OFFSET QUERY FAILED"
+  elif [ -z "${luks_payload_offset##*[!0-9]*}" ]; then
+    do_render_failure "LUKS_PAYLOAD_OFFSET NOT NUMERIC"
+  elif [ $luks_payload_offset -lt 1 ]; then
+    do_render_failure "LUKS_PAYLOAD_OFFSET INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! luks_payload_size=$(( $luks_payload_offset * 512 )); then
+    do_render_failure "LUKS_PAYLOAD_SIZE QUERY FAILED"
+  elif [ -z "${luks_payload_size##*[!0-9]*}" ]; then
+    do_render_failure "LUKS_PAYLOAD_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r pe_alloc_count << LVM; then
+$( lvm pvs --noheadings --options pe_alloc_count --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "PE_ALLOC_COUNT QUERY FAILED"
+  elif [ -z "${pe_alloc_count##*[!0-9]*}" ]; then
+    do_render_failure "PE_ALLOC_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r vg_ext_size << LVM; then
+$( lvm vgs --noheadings --options vg_extent_size --units b --nosuffix $vg_name )
+LVM
+    do_render_failure "VG_EXT_SIZE QUERY FAILED"
+  elif [ -z "${vg_ext_size##*[!0-9]*}" ]; then
+    do_render_failure "VG_EXT_SIZE NOT NUMERIC"
+  elif [ 0 -ne $(( $vg_ext_size % 512 )) ]; then
+    do_render_failure "VG_EXT_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_dm_path << LVM; then
+$( lvm pvs --noheadings --options lv_dm_path --select "lvname = $lv_name" $pv_dm_path )
+LVM
+    do_render_failure "LV_DM_PATH QUERY FAILED"
+  elif [ -z "$lv_dm_path" ]; then
+    do_render_failure "LV_DM_PATH EMPTY"
+  elif [ ! -b "$lv_dm_path" ]; then
+    do_render_failure "LV_DM_PATH INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_dev_size << LVM; then
+$( lvm lvs --noheadings --options lv_size --units b --nosuffix $lv_dm_path )
+LVM
+    do_render_failure "LV_DEV_SIZE QUERY FAILED"
+  elif [ -z "${lv_dev_size##*[!0-9]*}" ]; then
+    do_render_failure "LV_DEV_SIZE NOT NUMERIC"
+  elif [ 0 -ne $(( $lv_dev_size % $vg_ext_size )) ]; then
+    do_render_failure "LV_DEV_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! lv_ext_count=$(( $lv_dev_size / $vg_ext_size )); then
+    do_render_failure "LV_EXT_COUNT QUERY FAILED"
+  elif [ -z "${lv_ext_count##*[!0-9]*}" ]; then
+    do_render_failure "LV_EXT_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r fs_blk_count << DUMPE2FS; then
+$( dumpe2fs -h $lv_dm_path | grep -F 'Block count:' | tr -s ' ' '\t' | cut -f3 )
+DUMPE2FS
+    do_render_failure "FS_BLK_COUNT QUERY FAILED"
+  elif [ -z "${fs_blk_count##*[!0-9]*}" ]; then
+    do_render_failure "FS_BLK_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r fs_blk_free << DUMPE2FS; then
+$( dumpe2fs -h $lv_dm_path | grep -F 'Free blocks:' | tr -s ' ' '\t' | cut -f3 )
+DUMPE2FS
+    do_render_failure "FS_BLK_FREE QUERY FAILED"
+  elif [ -z "${fs_blk_free##*[!0-9]*}" ]; then
+    do_render_failure "FS_BLK_FREE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r fs_blk_size << DUMPE2FS; then
+$( dumpe2fs -h $lv_dm_path | grep -F 'Block size:' | tr -s ' ' '\t' | cut -f3 )
+DUMPE2FS
+    do_render_failure "FS_BLK_SIZE QUERY FAILED"
+  elif [ -z "${fs_blk_size##*[!0-9]*}" ]; then
+    do_render_failure "FS_BLK_SIZE NOT NUMERIC"
+  elif [ 0 -ne $(( $fs_blk_size % 512 )) ]; then
+    do_render_failure "FS_BLK_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif [ $fs_blk_free -gt 0 ] && ! e2fsck -f -y -v $lv_dm_path >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Shrink File System"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif [ $fs_blk_free -gt 0 ] && ! resize2fs -f -M $lv_dm_path >&2; then # MAY NEED TO BE RUN MULTIPLE TIMES: https://www.spinics.net/lists/linux-ext4/msg48082.html
+    do_render_failure "FAILED"
+#----------------------------------------------------------------------------------------------------
+#  elif ! read -r fs_blk_free << DUMPE2FS; then
+#$( dumpe2fs -h $lv_dm_path | grep -F 'Free blocks:' | tr -s ' ' '\t' | cut -f3 )
+#DUMPE2FS
+#    do_render_failure "FS_BLK_FREE QUERY FAILED"
+#  elif [ -z "${fs_blk_free##*[!0-9]*}" ]; then
+#    do_render_failure "FS_BLK_FREE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+#  elif [ $fs_blk_free -gt 0 ] && ! e2fsck -f -y -v $lv_dm_path >&2; then
+#    do_render_failure "FAILED"
+#----------------------------------------------------------------------------------------------------
+#  elif [ $fs_blk_free -gt 0 ] && ! resize2fs -f -M $lv_dm_path >&2; then
+#    do_render_failure "FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r new_fs_blk_count << DUMPE2FS; then
+$( dumpe2fs -h $lv_dm_path | grep -F 'Block count:' | tr -s ' ' '\t' | cut -f3 )
+DUMPE2FS
+    do_render_failure "NEW_FS_BLK_COUNT QUERY FAILED"
+  elif [ -z "${new_fs_blk_count##*[!0-9]*}" ]; then
+    do_render_failure "NEW_FS_BLK_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! new_fs_byt_size=$(( $new_fs_blk_count * $fs_blk_size )); then
+    do_render_failure "NEW_FS_BYT_SIZE QUERY FAILED"
+  elif [ -z "${new_fs_byt_size##*[!0-9]*}" ]; then
+    do_render_failure "NEW_FS_BYT_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! fs_blk_released=$(( $fs_blk_count - $new_fs_blk_count )); then
+    do_render_failure "FS_BLK_RELEASED QUERY FAILED"
+  elif [ -z "${fs_blk_released##*[!0-9]*}" ]; then
+    do_render_failure "FS_BLK_RELEASED NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! fs_mib_released=$(( ( $fs_blk_released * $fs_blk_size ) / 1048576 )); then
+    do_render_failure "FS_MIB_RELEASED QUERY FAILED"
+  elif [ -z "${fs_mib_released##*[!0-9]*}" ]; then
+    do_render_failure "FS_MIB_RELEASED NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! do_render_success "OK" "\033[1;35m[-${fs_mib_released} MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Shrink LVM Logical Volume"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! new_lv_ext_count=$(( ( $new_fs_byt_size / $vg_ext_size ) + ( $new_fs_byt_size % $vg_ext_size ? 1 : 0 ) )); then
+    do_render_failure "NEW_LV_EXT_COUNT QUERY FAILED"
+  elif [ -z "${new_lv_ext_count##*[!0-9]*}" ]; then
+    do_render_failure "NEW_LV_EXT_COUNT NOT NUMERIC"
+  elif [ $new_lv_ext_count -gt $lv_ext_count ]; then
+    do_render_failure "NEW_LV_EXT_COUNT INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! new_lv_dev_size=$(( $new_lv_ext_count * $vg_ext_size )); then
+    do_render_failure "NEW_LV_DEV_SIZE QUERY FAILED"
+  elif [ -z "${new_lv_dev_size##*[!0-9]*}" ]; then
+    do_render_failure "NEW_LV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! lv_ext_released=$(( $lv_ext_count - $new_lv_ext_count )); then
+    do_render_failure "LV_EXT_RELEASED QUERY FAILED"
+  elif [ -z "${lv_ext_released##*[!0-9]*}" ]; then
+    do_render_failure "LV_EXT_RELEASED NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! lv_mib_released=$(( ( $lv_ext_released * $vg_ext_size ) / 1048576 )); then
+    do_render_failure "LV_MIB_RELEASED QUERY FAILED"
+  elif [ -z "${lv_mib_released##*[!0-9]*}" ]; then
+    do_render_failure "LV_MIB_RELEASED NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $new_lv_ext_count -lt $lv_ext_count ] && ! lvm lvreduce --config 'backup {backup = 0 archive = 0}' --verbose --autobackup n --force --nofsck --size "${new_lv_dev_size}b" $lv_dm_path >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK" "\033[1;35m[-${lv_mib_released} MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Shrink LVM Physical Volume"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r pe_start << LVM; then
+$( lvm pvs --noheadings --options pe_start --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "PE_START QUERY FAILED"
+  elif [ -z "${pe_start##*[!0-9]*}" ]; then
+    do_render_failure "PE_START NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r new_pe_alloc_count << LVM; then
+$( lvm pvs --noheadings --options pe_alloc_count --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "NEW_PE_ALLOC_COUNT QUERY FAILED"
+  elif [ -z "${new_pe_alloc_count##*[!0-9]*}" ]; then
+    do_render_failure "NEW_PE_ALLOC_COUNT NOT NUMERIC"
+  elif [ $new_pe_alloc_count -gt $pe_alloc_count ]; then
+    do_render_failure "NEW_PE_ALLOC_COUNT INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! new_pv_dev_size=$(( $pe_start + ( $new_pe_alloc_count * $vg_ext_size ) )); then
+    do_render_failure "NEW_PV_DEV_SIZE QUERY FAILED"
+  elif [ -z "${new_pv_dev_size##*[!0-9]*}" ]; then
+    do_render_failure "NEW_PV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! pe_released_count=$(( $pe_alloc_count - $new_pe_alloc_count )); then
+    do_render_failure "PE_RELEASED_COUNT QUERY FAILED"
+  elif [ -z "${pe_released_count##*[!0-9]*}" ]; then
+    do_render_failure "PE_RELEASED_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! pe_released_mib=$(( ( $pe_released_count * $vg_ext_size ) / 1048576 )); then
+    do_render_failure "PE_RELEASED_MIB QUERY FAILED"
+  elif [ -z "${pe_released_mib##*[!0-9]*}" ]; then
+    do_render_failure "PE_RELEASED_MIB NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $pe_released_count -gt 0 ] && ! echo y | lvm pvresize --verbose --config 'backup {backup = 0 archive = 0}' --setphysicalvolumesize "${new_pv_dev_size}b" $pv_dm_path >&2; then
+    do_render_failure "PV RESIZE FAILED"
+  elif ! do_render_success "OK" "\033[1;35m[-${pe_released_mib} MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Shrink LUKS Crypto Container"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! new_part_dev_size=$(( $luks_payload_size + $pe_start + ( $new_pe_alloc_count * $vg_ext_size ) )); then
+    do_render_failure "NEW_PART_DEV_SIZE QUERY FAILED"
+  elif [ -z "${new_part_dev_size##*[!0-9]*}" ]; then
+    do_render_failure "NEW_PART_DEV_SIZE NOT NUMERIC"
+  elif [ 0 -ne $(( $new_part_dev_size % 512 )) ]; then
+    do_render_failure "NEW_PART_DEV_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! new_part_sector_count=$(( $new_part_dev_size / 512 )); then
+    do_render_failure "NEW_PART_SECTOR_COUNT QUERY FAILED"
+  elif [ -z "${new_part_sector_count##*[!0-9]*}" ]; then
+    do_render_failure "NEW_PART_SECTOR_COUNT NOT NUMERIC"
+  elif [ $new_part_sector_count -gt $part_size -o $new_part_sector_count -lt 14336 ]; then
+    do_render_failure "NEW_PART_SECTOR_COUNT INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! part_released_sector_count=$(( $part_size - $new_part_sector_count )); then
+    do_render_failure "PART_RELEASED_SECTOR_COUNT QUERY FAILED"
+  elif [ -z "${part_released_sector_count##*[!0-9]*}" ]; then
+    do_render_failure "PART_RELEASED_SECTOR_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! part_released_mib=$(( $part_released_sector_count / 2048 )); then
+    do_render_failure "PART_RELEASED_MIB QUERY FAILED"
+  elif [ -z "${part_released_mib##*[!0-9]*}" ]; then
+    do_render_failure "PART_RELEASED_MIB NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $part_released_sector_count -gt 0 ] && ! cryptsetup resize --verbose --size $new_part_sector_count $TARGET >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK" "\033[1;35m[-${part_released_mib} MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Deactivate LVM Logical Volumes"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! lvm vgchange --verbose --activate n $vg_name >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Close LUKS Crypto Container"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! cryptsetup luksClose --batch-mode --verbose $TARGET >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Shrink Crypto Partition"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! part_minimum_last_sector=$(( $part_start + $new_part_sector_count - 1 )); then
+    do_render_failure "PART_MINIMUM_LAST_SECTOR QUERY FAILED"
+  elif [ -z "${part_minimum_last_sector##*[!0-9]*}" ]; then
+    do_render_failure "PART_MINIMUM_LAST_SECTOR NOT NUMERIC"
+  elif [ $part_minimum_last_sector -gt $part_current_last_sector ]; then
+    do_render_failure "PART_MINIMUM_LAST_SECTOR INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! part_released_sector_count=$(( $part_current_last_sector - $part_minimum_last_sector )); then
+    do_render_failure "PART_RELEASED_SECTOR_COUNT QUERY FAILED"
+  elif [ -z "${part_released_sector_count##*[!0-9]*}" ]; then
+    do_render_failure "PART_RELEASED_SECTOR_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! part_released_mib=$(( $part_released_sector_count / 2048 )); then
+    do_render_failure "PART_RELEASED_MIB QUERY FAILED"
+  elif [ -z "${part_released_mib##*[!0-9]*}" ]; then
+    do_render_failure "PART_RELEASED_MIB NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! yes | parted ---pretend-input-tty "/dev/$disk_name" resizepart "$part_num" "${part_minimum_last_sector}s" >&2; then
+    do_render_failure "RESIZE PARTITION FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! sync "/dev/$disk_name" >&2; then
+    do_render_failure "SYNC DEVICE FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r part_detected_new_size < /sys/class/block/$part_name/size; then
+    do_render_failure "READ PARTITION SIZE FAILED"
+  elif [ "$part_detected_new_size" -ne "$new_part_sector_count" ]; then
+    do_render_failure "UNEXPECTED NEW PARTITION SIZE"
+  else
+    do_render_success "OK" "\033[1;35m[-${part_released_mib} MiB]\033[0m"
+  fi
+
+#####################################################################################################
+#####################################################################################################
+#####################################################################################################
+
+  if [ -z "$vg_name" -o ! -d "/dev/$vg_name" ]; then
+    :
+  elif ! do_render_action "Deactivate LVM Logical Volumes"; then
+    :
+  elif ! lvm vgchange --config 'backup {backup = 0 archive = 0}' --verbose --activate n $vg_name >&2; then
+    do_render_failure "FAILED"
+  else
+    do_render_success "OK"
+  fi
+
+  if [ ! -b $pv_dm_path ]; then
+    :
+  elif ! do_render_action "Close LUKS Crypto Container"; then
+    :
+  elif ! cryptsetup luksClose --batch-mode --verbose $TARGET >&2; then
+    do_render_failure "FAILED"
+  else
+    do_render_success "OK"
+  fi
+
+# set +x
+
+) 2>/tmp/shrink.log
+
+#####################################################################################################
+#####################################################################################################
+#####################################################################################################
+
+    do_press_enter_to_continue
+}
+
+do_expand_to_max_size() {
+
+  local input= key=
+
+  local pv_dm_path=/dev/mapper/$TARGET
+
+  local part_name=${DEV##*/}
+  local part_num=$(cat /sys/class/block/$part_name/partition 2>/dev/null)
+  local part_start=$(cat /sys/class/block/$part_name/start 2>/dev/null)
+  local part_size=$(cat /sys/class/block/$part_name/size 2>/dev/null)
+  local part_path=$(readlink -f /sys/class/block/$part_name 2>/dev/null)
+  local part_size_mb=$(( $part_size / 2048 ))
+
+  local part_start_max=$(cat /sys/class/block/${part_name%[0-9]*}*/start | sort -n | tail -n1)
+
+  local disk_path=${part_path%/*}
+  local disk_name=${disk_path##*/}
+  local disk_size=$(cat /sys/block/$disk_name/size 2>/dev/null)
+  local disk_type=$(cat /sys/block/$disk_name/device/type 2>/dev/null)
+
+  local part_current_last_sector=$(( $part_start + $part_size - 1 ))
+  local part_maximum_last_sector=$(( $disk_size - 34 )) # gpt compatible
+
+  local disk_free=$(( $part_maximum_last_sector - $part_current_last_sector ))
+  local disk_size_mb=$(( $disk_size / 2048 ))
+  local disk_free_mb=$(( $disk_free / 2048 ))
+
+  local part_detected_new_size=
+  local part_expected_new_size=$(( part_size + disk_free ))
+
+  local part_unallocated_mib= part_unallocated_sector_count=
+  local pv_dev_name= pv_dev_size= pv_size=
+  local vg_free= vg_name=
+  local pe_count= pe_free= pe_size= pe_start=
+  local lv_dev_name= lv_dev_size= lv_dm_path= lv_fs_blk_count= lv_fs_blk_size= lv_fs_size= lv_name=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "EXPAND PARTITION"
+
+  echo -e " \033[1;33mWARNING: You are about to expand the crypto partition:\033[0m"
+  echo ""
+  echo -e " \033[1;35m${DEV}\033[0m \033[1;34m(${part_size_mb} MiB)\033[0m \033[1;33mon the device\033[0m"
+  echo ""
+  echo -e " \033[1;36m$( do_get_device_name $disk_name )\033[0m \033[1;34m(${disk_free_mb} MiB of ${disk_size_mb} MiB unallocated)\033[0m${disk_type:+ \033[1;37m[Type: ${disk_type}]\033[0m}"
+  echo ""
+  echo -e " \033[1;33mBy enlarging the partition it is possible to use the entire\033[0m"
+  echo -e " \033[1;33mspace of the device.\033[0m"
+  echo ""
+  echo -e " \033[1;31mDO NOT DO THIS WITHOUT PREVIOUS BACKUP!\033[0m"
+  echo ""
+  echo ""
+
+  do_type_uppercase_yes_to_continue || return 0
+
+  if [ -z "$KEY" ]; then
+    do_request_key_or_passphrase || return 0
+    key="$input"
+  fi
+
+(
+
+# set -x
+
+#####################################################################################################
+  if ! do_render_action "Extend Crypto Partition"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif [ -z "${part_num##*[!0-9]*}" ]; then
+    do_render_failure "PART_NUM NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $part_current_last_sector -gt $part_maximum_last_sector ]; then
+    do_render_failure "DISK IS TOO SMALL"
+#----------------------------------------------------------------------------------------------------
+  elif [ $part_start -ne $part_start_max ]; then
+    do_render_failure "PART_START NOT EQUAL PART_START_MAX"
+#----------------------------------------------------------------------------------------------------
+  elif ! part_unallocated_sector_count=$(( $part_maximum_last_sector - $part_current_last_sector )); then
+    do_render_failure "PART_UNALLOCATED_SECTOR_COUNT QUERY FAILED"
+  elif [ -z "${part_unallocated_sector_count##*[!0-9]*}" ]; then
+    do_render_failure "PART_UNALLOCATED_SECTOR_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! part_unallocated_mib=$(( $part_unallocated_sector_count / 2048 )); then
+    do_render_failure "PART_UNALLOCATED_MIB QUERY FAILED"
+  elif [ -z "${part_unallocated_mib##*[!0-9]*}" ]; then
+    do_render_failure "PART_UNALLOCATED_MIB NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! yes | parted ---pretend-input-tty "/dev/$disk_name" resizepart "$part_num" "${part_maximum_last_sector}s" >&2; then
+    do_render_failure "RESIZE PARTITION FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! sync "/dev/$disk_name"  >&2; then
+    do_render_failure "SYNC DEVICE FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r part_detected_new_size < /sys/class/block/$part_name/size; then
+    do_render_failure "READ PARTITION SIZE FAILED"
+  elif [ "$part_detected_new_size" -ne "$part_expected_new_size" ]; then
+    do_render_failure "UNEXPECTED NEW PARTITION SIZE"
+  elif ! do_render_success "OK" "\033[1;35m[+${part_unallocated_mib} MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Open LUKS Crypto Container"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif [ ! -b "$pv_dm_path" ] && ! do_cat_key "${KEY:-$key}" | cryptsetup luksOpen --batch-mode --verbose --key-file=- $DEV $TARGET >&2; then
+    do_render_failure "FAILED"
+  elif [ ! -b "$pv_dm_path" ]; then
+    do_render_failure "PV_DM_PATH INVALID"
+#----------------------------------------------------------------------------------------------------
+# elif ! pv_dev_name=`dmsetup info --columns --noheadings --options blkdevname $pv_dm_path | sed 's/^\s*//g; s/\s*$//g' 2>/dev/null`; then
+#   do_render_failure "PV_DEV_NAME QUERY FAILED"
+# elif [ -z "$pv_dev_name" ]; then
+#   do_render_failure "PV_DEV_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Extend LUKS Crypto Container"; then
+    :
+  elif [ $part_unallocated_sector_count -gt 0 ] && ! cryptsetup resize --verbose $TARGET >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK" "\033[1;35m[+${part_unallocated_mib} MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Extend LVM Physical Volume"; then
+    :
+#----------------------------------------------------------------------------------------------------
+# elif ! pv_dev_size=`cat /sys/block/$pv_dev_name/size`; then
+#   do_render_failure "PV_DEV_SIZE QUERY FAILED"
+# elif [ -z "${pv_dev_size##*[!0-9]*}" ]; then
+#   do_render_failure "PV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r pv_dev_size << LVM; then
+$( lvm pvs --noheadings --options dev_size --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "PV_DEV_SIZE QUERY FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif [ -z "${pv_dev_size##*[!0-9]*}" ]; then
+    do_render_failure "PV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r pe_start << LVM; then
+$( lvm pvs --noheadings --options pe_start --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "PE_START QUERY FAILED"
+  elif [ -z "${pe_start##*[!0-9]*}" ]; then
+    do_render_failure "PE_START NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r pv_size << LVM; then
+$( lvm pvs --noheadings --options pv_size --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "PV_SIZE QUERY FAILED"
+  elif [ -z "${pv_size##*[!0-9]*}" ]; then
+    do_render_failure "PV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r pe_count << LVM; then
+$( lvm pvs --noheadings --options pe_count --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "PE_COUNT QUERY FAILED"
+  elif [ -z "${pe_count##*[!0-9]*}" ]; then
+    do_render_failure "PE_COUNT NOT NUMERIC"
+  elif [ 0 -ne $(( $pv_size % $pe_count )) ]; then
+    do_render_failure "PE_COUNT INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! pe_size=$(( $pv_size / $pe_count )); then
+    do_render_failure "PE_SIZE QUERY FAILED"
+  elif [ -z "${pe_size##*[!0-9]*}" ]; then
+    do_render_failure "PE_SIZE NOT NUMERIC"
+  elif [ 0 -ne $(( $pe_size % 512 )) ]; then
+    do_render_failure "PE_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! pe_free=$(( ( $pv_dev_size - $pe_start - $pv_size ) / $pe_size )); then
+    do_render_failure "PE_FREE QUERY FAILED"
+  elif [ -z "${pe_free##*[!0-9]*}" ]; then
+    do_render_failure "PE_FREE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $pe_free -gt 0 ] && ! lvm pvresize --config 'backup {backup = 0 archive = 0}' --verbose $pv_dm_path >&2; then
+    do_render_failure "PV RESIZE FAILED"
+  elif ! do_render_success "OK" "\033[1;35m[+$(( $pe_free * $pe_size / 1048576 )) MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Activate LVM Logical Volumes"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r vg_name << LVM; then
+$( lvm pvs --noheading -o vgname $pv_dm_path )
+LVM
+    do_render_failure "VG_NAME QUERY FAILED"
+  elif [ -z "$vg_name" ]; then
+    do_render_failure "VG_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+  elif ! lvm vgchange --config 'backup {backup = 0 archive = 0}' --verbose --activate y $vg_name >&2; then
+    do_render_failure "FAILED"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_name << LVM; then
+$( lvm pvs --noheadings -o seg_le_ranges,lv_name --select "vgname = $vg_name" $pv_dm_path | cut -f2 -d: | sort -n | tail -n1 | tr -s ' ' | cut -f2 -d' ' )
+LVM
+    do_render_failure "LV_NAME QUERY FAILED"
+  elif [ -z "$lv_name" ]; then
+    do_render_failure "LV_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Extend LVM Logical Volume"; then
+    :
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_dm_path << LVM; then
+$( lvm pvs --noheadings --options lv_dm_path --select "lvname = $lv_name" $pv_dm_path )
+LVM
+    do_render_failure "LV_DM_PATH QUERY FAILED"
+  elif [ -z "$lv_dm_path" ]; then
+    do_render_failure "LV_DM_PATH EMPTY"
+  elif [ ! -b "$lv_dm_path" ]; then
+    do_render_failure "LV_DM_PATH INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r vg_free << LVM; then
+$( lvm pvs --noheadings --options vg_free --units b --nosuffix $pv_dm_path )
+LVM
+    do_render_failure "VG_FREE QUERY FAILED"
+  elif [ -z "${vg_free##*[!0-9]*}" ]; then
+    do_render_failure "VG_FREE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif [ $vg_free -gt 0 ] && ! lvm lvextend --config 'backup {backup = 0 archive = 0}' --verbose --autobackup n --force --nofsck --extents +100%FREE $lv_dm_path $pv_dm_path >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK" "\033[1;35m[+$(( $vg_free / 1048576 )) MiB]\033[0m"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Checking File System"; then
+    :
+  elif ! e2fsck -f -y -v $lv_dm_path >&2; then
+    do_render_failure "FAILED"
+  elif ! do_render_success "OK"; then
+    :
+#####################################################################################################
+  elif ! do_render_action "Extend File System"; then
+    :
+#----------------------------------------------------------------------------------------------------
+# elif ! lv_dev_name=`dmsetup info --columns --noheadings --options blkdevname $lv_dm_path | sed 's/^\s*//g; s/\s*$//g' 2>/dev/null`; then
+#   do_render_failure "LV_DEV_NAME QUERY FAILED"
+# elif [ -z "$lv_dev_name" ]; then
+#   do_render_failure "LV_DEV_NAME EMPTY"
+#----------------------------------------------------------------------------------------------------
+#/sys/block/dm-2/queue/max_segment_size:4096
+#/sys/block/dm-2/queue/hw_sector_size:512
+#/sys/block/dm-2/queue/logical_block_size:512
+#/sys/block/dm-2/queue/minimum_io_size:512
+#/sys/block/dm-2/queue/physical_block_size:512
+#----------------------------------------------------------------------------------------------------
+# elif ! lv_dev_size=`cat /sys/block/$lv_dev_name/size`; then
+#   do_render_failure "LV_DEV_SIZE QUERY FAILED"
+# elif [ -z "${lv_dev_size##*[!0-9]*}" ]; then
+#   do_render_failure "LV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_dev_size << LVM; then
+$( lvm lvs --noheadings --options lv_size --units b --nosuffix $lv_dm_path )
+LVM
+    do_render_failure "LV_DEV_SIZE QUERY FAILED"
+  elif [ -z "${lv_dev_size##*[!0-9]*}" ]; then
+    do_render_failure "LV_DEV_SIZE NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_fs_blk_count << DUMPE2FS; then
+$( dumpe2fs -h $lv_dm_path | grep -F 'Block count:' | tr -s ' ' '\t' | cut -f3 )
+DUMPE2FS
+    do_render_failure "LV_FS_BLK_COUNT QUERY FAILED"
+  elif [ -z "${lv_fs_blk_count##*[!0-9]*}" ]; then
+    do_render_failure "LV_FS_BLK_COUNT NOT NUMERIC"
+#----------------------------------------------------------------------------------------------------
+  elif ! read -r lv_fs_blk_size << DUMPE2FS; then
+$( dumpe2fs -h $lv_dm_path | grep -F 'Block size:' | tr -s ' ' '\t' | cut -f3 )
+DUMPE2FS
+    do_render_failure "LV_FS_BLK_SIZE QUERY FAILED"
+  elif [ -z "${lv_fs_blk_size##*[!0-9]*}" ]; then
+    do_render_failure "LV_FS_BLK_SIZE NOT NUMERIC"
+  elif [ 0 -ne $(( $lv_fs_blk_size % 512 )) ]; then
+    do_render_failure "LV_FS_BLK_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif ! lv_fs_size=$(( $lv_fs_blk_count * $lv_fs_blk_size )); then
+    do_render_failure "LV_FS_SIZE QUERY FAILED"
+  elif [ $lv_fs_size -gt $lv_dev_size ]; then
+    do_render_failure "LV_FS_SIZE INVALID"
+#----------------------------------------------------------------------------------------------------
+  elif [ $lv_fs_size -lt $lv_dev_size ] && ! resize2fs -f $lv_dm_path >&2; then
+    do_render_failure "FAILED"
+  else
+    do_render_success "OK" "\033[1;35m[+$(( ( $lv_dev_size - $lv_fs_size ) / 1048576 )) MiB]\033[0m"
+  fi
+
+#####################################################################################################
+#####################################################################################################
+#####################################################################################################
+
+  if [ -z "$vg_name" -o ! -d "/dev/$vg_name" ]; then
+    :
+  elif ! do_render_action "Deactivate LVM Logical Volumes"; then
+    :
+  elif ! lvm vgchange --config 'backup {backup = 0 archive = 0}' --verbose --activate n $vg_name >&2; then
+    do_render_failure "FAILED"
+  else
+    do_render_success "OK"
+  fi
+
+  if [ ! -b $pv_dm_path ]; then
+    :
+  elif ! do_render_action "Close LUKS Crypto Container"; then
+    :
+  elif ! cryptsetup luksClose --batch-mode --verbose $TARGET >&2; then
+    do_render_failure "FAILED"
+  else
+    do_render_success "OK"
+  fi
+
+# set +x
+
+) 2>/tmp/expand.log
+
+#####################################################################################################
+#####################################################################################################
+#####################################################################################################
+
+    do_press_enter_to_continue
+}
+
+do_reencrypt_device() {
+
+  local input= key= keyslot= keytype=
+
+  local cryptsetup_reencrypt=
+
+  local part_name=${DEV##*/}
+  local part_start=$(cat /sys/class/block/$part_name/start 2>/dev/null)
+  local part_size=$(cat /sys/class/block/$part_name/size 2>/dev/null)
+  local part_path=$(readlink -f /sys/class/block/$part_name 2>/dev/null)
+  local part_size_mb=$(( $part_size / 2048 ))
+
+  local disk_path=${part_path%/*}
+  local disk_name=${disk_path##*/}
+  local disk_size=$(cat /sys/block/$disk_name/size 2>/dev/null)
+  local disk_type=$(cat /sys/block/$disk_name/device/type 2>/dev/null)
+
+  local part_current_last_sector=$(( $part_start + $part_size - 1 ))
+  local part_maximum_last_sector=$(( $disk_size - 34 ))
+
+  local disk_free=$(( $part_maximum_last_sector - $part_current_last_sector ))
+  local disk_size_mb=$(( $disk_size / 2048 ))
+  local disk_free_mb=$(( $disk_free / 2048 ))
+
+  local estimated_duration_raw=$(( $part_size / 9320 ))
+  local estimated_duration_hrs=$(( $estimated_duration_raw / 3600 ))
+  local estimated_duration_min=$(( $estimated_duration_raw % 3600 / 60 ))
+  local estimated_duration_sec=$(( $estimated_duration_raw % 60))
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "RE-ENCRYPT PARTITION"
+
+  echo -e " \033[1;33mWARNING: You are about to re-encrypt the crypto partition:\033[0m"
+  echo ""
+  echo -e " \033[1;35m${DEV}\033[0m \033[1;34m(${part_size_mb} MiB)\033[0m \033[1;33mon the device\033[0m"
+  echo ""
+  echo -e " \033[1;36m$( do_get_device_name $disk_name )\033[0m \033[1;34m(${disk_free_mb} MiB of ${disk_size_mb} MiB unallocated)\033[0m${disk_type:+ \033[1;37m[Type: ${disk_type}]\033[0m}"
+  echo ""
+  echo -e " \033[1;33mThis takes a considerable amount of time depending on the\033[0m"
+  echo -e " \033[1;33msize of the partition (about 1 hour per 16 GiB).\033[0m"
+  echo ""
+  echo -e " \033[1;33mThe estimated duration is\033[0m \033[1;35m${estimated_duration_hrs} hours\033[0m \033[1;33mand\033[0m \033[1;35m${estimated_duration_min} minutes\033[0m\033[1;33m.\033[0m"
+  echo ""
+  echo -e " \033[1;33mYou can speed up this process by first reducing the partition to\033[0m"
+  echo -e " \033[1;33mthe minimum size and then enlarging it again after re-encryption.\033[0m"
+  echo ""
+  echo -e " \033[1;31mDO NOT DO THIS WITHOUT PREVIOUS BACKUP!\033[0m"
+  echo ""
+  echo ""
+
+  do_type_uppercase_yes_to_continue || return 0
+
+  if [ -z "$KEY" ]; then
+
+    do_request_key_or_passphrase || return 0
+    key="$input"
+
+    if input_is_uuencoded "$key"; then
+      keytype=KEY
+    else
+      keytype=PASSPHRASE
+    fi
+
+  else
+
+    keytype='KEY FILE'
+
+  fi
+
+  if which cryptsetup-reencrypt >/dev/null; then
+    cryptsetup_reencrypt=cryptsetup-reencrypt
+  else
+    cryptsetup_reencrypt="cryptsetup reencrypt"
+  fi
+
+  trap '' INT # disabled CTRL-C for us and all child processes (NOTE: setsid must also be used)
+
+  # --------------------------------------------------------------------------
+  if ! do_render_action "Searching key slot..."; then
+    :
+  elif ! keyslot=$( do_get_key_slot "${KEY:-$key}" ); then
+    do_render_warning "NO KEY SLOT FOUND FOR THE GIVEN $keytype"
+  elif ! do_render_success "OK (KEY SLOT $keyslot)"; then
+    :
+  # --------------------------------------------------------------------------
+  elif ! do_render_action "Checking crypto properties..."; then
+    :
+  elif [ -z "$cipher_name" ]; then
+    do_render_warning "FAILED TO DETECT CURRENT CIPHER NAME"
+  elif [ -z "$cipher_mode" ]; then
+    do_render_warning "FAILED TO DETECT CURRENT CIPHER MODE"
+  elif [ -z "$hash_spec" ]; then
+    do_render_warning "FAILED TO DETECT CURRENT HASH"
+  elif [ -z "$mk_bits" ]; then
+    do_render_warning "FAILED TO DETECT CURRENT KEY SIZE"
+  elif ! do_render_success "OK (luks$version/$cipher_name-$cipher_mode/$hash_spec/$mk_bits)"; then
+    :
+  # --------------------------------------------------------------------------
+  elif ! do_render_warning "DO NOT PRESS CTRL-C EVEN IF THE PROGRESS HANGS FOR DOZENS OF MINUTES!"; then
+    :
+  elif ! do_cat_key "${KEY:-$key}" | setsid $cryptsetup_reencrypt --cipher=$cipher_name-$cipher_mode --hash=$hash_spec --iter-time=${iter_time:-2000} --key-file=- --key-size=$mk_bits --key-slot=$keyslot $DEV; then
+    echo
+    do_render_failure "FAILED TO RE-ENCRYPT THE CRYPTO PARTITION"
+  else
+    echo
+    do_render_success "CRYPTO PARTITION SUCCESSFULLY RE-ENCRYPTED"
+  fi
+
+  trap : INT # disabled CTRL-C only for us but not for child processes
+
+  do_press_enter_to_continue
+}
+
+do_get_key_slot() { # $1 = uuencoded key or passphrase
+  local key_slot=
+  for key_slot in 0 1 2 3 4 5 6 7; do
+    if do_cat_key "$1" | cryptsetup luksOpen --verbose --batch-mode --key-file=- --key-slot=$key_slot --test-passphrase "$DEV" >/dev/null 2>&1; then
+      echo $key_slot && return 0
+    fi
+  done
+  return 1
+}
+
+input_is_uuencoded() { # $1 = input
+  [ -n "$1" ] && [ \
+    -z        "${1##begin[[:space:]][0-9][0-9][0-9][[:space:]]*[[:graph:]][[:space:]]*[[:graph:]]*[[:space:]]end}" -o \
+    -z "${1##begin-base64[[:space:]][0-9][0-9][0-9][[:space:]]*[[:graph:]][[:space:]]*[[:graph:]]*[[:space:]]====}" \
+  ]
+}
+
+begin_is_uuencoded() { # $1 = input
+  [ -n "$1" ] && [ \
+    -z        "${1##begin[[:space:]][0-9][0-9][0-9][[:space:]]*[[:graph:]]}" -o \
+    -z "${1##begin-base64[[:space:]][0-9][0-9][0-9][[:space:]]*[[:graph:]]}" \
+  ]
+}
+
+do_request_key_or_passphrase() {
+
+  echo ""
+  echo -e -n " ${1:-Enter any existing passphrase or uuencoded key:} \033[1;36m" >&2
+  do_read_key_input
+  exit_status=$?
+  echo -e "\033[0m"
+  echo ""
+
+  if [ "$exit_status" -ne 0 ]; then
+    do_handle_invalid_key_input $exit_status
+    return $exit_status
+  fi
+}
+
+do_read_key_input() {
+
+# NOTE: The variable 'input' must be declared by the caller
+
+  local line=
+
+  IFS= read $key_read_opts -r input || return $?
+
+  if begin_is_uuencoded "$input"; then
+    while IFS= read $key_read_opts -r line || [ -n "$line" ]; do
+      if [ -z "$line" ]; then
+        return 2
+      fi
+      input="$input
+$line"
+      if [ "$line" = "end" -o "$line" = "====" ]; then
+        return 0
+      fi
+    done
+    return 3
+  fi
+}
+
+do_cat_key() { # $1 = passphrase or uuencoded key
+  if [ -n "$KEY" -a "$KEY" = "$1" ]; then
+    cat "$KEY"
+  elif input_is_uuencoded "$1"; then
+    printf %s "$1" | uudecode -o /dev/stdout
+  else
+    printf %s "$1"
+  fi
+}
+
+do_handle_invalid_key_input() { # $1 = exit status
+
+  case "$1" in
+    3) do_render_failure "The last line of an uuencoded key must be '====' or 'end' but it is missing in your input" ;;
+    2) do_render_failure "A uuencoded key cannot contain blank lines, but your input contains one" ;;
+    1) do_render_warning "You have aborted the key input" ;;
+    *) do_render_failure "Unknown error (exit status: $1)" ;;
+  esac
+
+  do_press_enter_to_continue
+}
+
+do_search_key_slot_by_passphrase() {
+
+  local input= keyslot= keytype=
+
+  do_clear_screen
+
+  do_render_header "CRYPTO MANAGER" "SEARCH KEY SLOT"
+
+  do_request_key_or_passphrase || return $?
+
+  if input_is_uuencoded "$input"; then
+    keytype=KEY
+  else
+    keytype=PASSPHRASE
+  fi
+
+  do_render_action "Searching..."
+
+  if ! keyslot=$( do_get_key_slot "$input" ); then
+    do_render_failure "$keytype NOT FOUND"
+  else
+    do_render_success "$keytype FOUND IN KEY SLOT '$keyslot'"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_parse_crypto_properties() { # $1 = device path
+  cryptsetup luksDump "$1" | {
+    local version=
+    local cipher_name=
+    local cipher_mode=
+    local hash_spec=
+    local mk_bits=
+    local uuid=
+    local key_slot_0=DISABLED
+    local key_slot_1=DISABLED
+    local key_slot_2=DISABLED
+    local key_slot_3=DISABLED
+    local key_slot_4=DISABLED
+    local key_slot_5=DISABLED
+    local key_slot_6=DISABLED
+    local key_slot_7=DISABLED
+    local a b c d
+    while IFS=":$IFS" read -r a b c d; do
+      case "$a,$b,$c,$d" in
+        Version,*,,)                  version="$b" ;;
+        Cipher,name,*,)               cipher_name="$c" ;;
+        Cipher,mode,*,)               cipher_mode="$c" ;;
+        cipher,*,,)                   cipher_name="${b%%-*}" cipher_mode="${b#*-}" ;;
+        Hash,spec,*,)                 hash_spec="$c" ;;
+        Hash,*,,)                     hash_spec="$b" ;;
+        MK,bits,*,)                   mk_bits="$c" ;;
+        Key,*,bits,)                  mk_bits="$b" ;;
+        UUID,*,,)                     uuid="$b" ;;
+        Key,Slot,0,ENABLED|0,luks2,,) key_slot_0="ENABLED" ;;
+        Key,Slot,1,ENABLED|1,luks2,,) key_slot_1="ENABLED" ;;
+        Key,Slot,2,ENABLED|2,luks2,,) key_slot_2="ENABLED" ;;
+        Key,Slot,3,ENABLED|3,luks2,,) key_slot_3="ENABLED" ;;
+        Key,Slot,4,ENABLED|4,luks2,,) key_slot_4="ENABLED" ;;
+        Key,Slot,5,ENABLED|5,luks2,,) key_slot_5="ENABLED" ;;
+        Key,Slot,6,ENABLED|6,luks2,,) key_slot_6="ENABLED" ;;
+        Key,Slot,7,ENABLED|7,luks2,,) key_slot_7="ENABLED" ;;
+      esac
+    done
+    echo "version='$version'"
+    echo "cipher_name='$cipher_name'"
+    echo "cipher_mode='$cipher_mode'"
+    echo "hash_spec='$hash_spec'"
+    echo "mk_bits='$mk_bits'"
+    echo "uuid='$uuid'"
+    echo "key_slot_0='$key_slot_0'"
+    echo "key_slot_1='$key_slot_1'"
+    echo "key_slot_2='$key_slot_2'"
+    echo "key_slot_3='$key_slot_3'"
+    echo "key_slot_4='$key_slot_4'"
+    echo "key_slot_5='$key_slot_5'"
+    echo "key_slot_6='$key_slot_6'"
+    echo "key_slot_7='$key_slot_7'"
+  }
+}
+
+do_import_crypto_properties() { # $1 = device path
+. /dev/stdin << ENV
+$( do_parse_crypto_properties "$1" )
+ENV
+}
+
+do_dump_crypto_properties() {
+  do_clear_screen
+  echo ""
+  echo -e "   Device: \033[1;32m$DEV\033[0m"
+  echo -e "     UUID: \033[1;32m$uuid\033[0m"
+  echo -e "  Version: \033[1;32m$version\033[0m"
+  echo -e "   Cipher: \033[1;32m$cipher_name-$cipher_mode\033[0m"
+  echo -e "     Hash: \033[1;32m$hash_spec\033[0m"
+  echo -e " Key size: \033[1;32m$mk_bits\033[0m"
+  do_press_enter_to_continue
+}
+
+do_render_crypto_manager() {
+
+  local input= key_slot= status=
+
+  local version= cipher_name= cipher_mode= hash_spec= mk_bits= uuid= key_slot_0= key_slot_1= key_slot_2= key_slot_3= key_slot_4= key_slot_5= key_slot_6= key_slot_7=
+
+  while true; do
+
+    do_clear_screen
+
+    do_import_crypto_properties "$DEV"
+
+    do_render_header "CRYPTO MANAGER"
+
+    for status in "0:$key_slot_0" "1:$key_slot_1" "2:$key_slot_2" "3:$key_slot_3" "4:$key_slot_4" "5:$key_slot_5" "6:$key_slot_6" "7:$key_slot_7"; do
+      case "$status" in
+        [0-7]:DISABLED) echo -e " ${status%%:*}) \033[1;33m${status##*:}\033[0m" ;;
+        [0-7]:ENABLED)  echo -e " ${status%%:*}) \033[1;32m${status##*:}\033[0m" ;;
+      esac
+    done
+
+    echo ""
+#   echo " D) DUMP CRYPTO PROPERTIES"
+    echo -e " I) ITER TIME [\033[1;36m${iter_time:-2000}ms\033[0m]"
+    echo -e " P) SHOW PASSPHRASES [\033[1;36m$( [ "$key_read_opts" = '-s' ] && echo NO || echo YES )\033[0m]"
+    echo ""
+    echo " E) EXPAND TO MAX SIZE"
+    echo " S) SHRINK TO MIN SIZE"
+    echo " R) RE-ENCRYPT DEVICE"
+    echo " K) SEARCH KEY SLOT"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      [0-7]) key_slot=$input do_render_keyslot_manager ;;
+#       D|d) do_dump_crypto_properties ;;
+        E|e) do_expand_to_max_size ;;
+        S|s) do_shrink_to_min_size ;;
+        I|i) do_change_default_iter_time ;;
+        P|p) do_change_passphrase_visibility ;;
+        R|r) do_reencrypt_device ;;
+        K|k) do_search_key_slot_by_passphrase ;;
+        B|b) break ;;
+    esac
+
+  done
+}
+
+do_execute_chroot_command() {
+
+  local exit_status=0 lang= hostname= home=
+
+  do_clear_screen
+
+  if do_system_partitions_up; then
+
+    if do_chroot_up; then
+
+      if ! LANG=${lang:-C.UTF-8} HOSTNAME=${hostname:-debian} HOME=${home:-/root} PWD=${home:-/root} SHELL=/bin/bash unshare --uts chroot /mnt /bin/bash -c 'hostname "$HOSTNAME";cd "$HOME";'"$1"; then
+
+        exit_status=$?
+
+      fi
+
+    fi
+
+    do_chroot_down
+
+    do_system_partitions_down
+
+  else
+
+    case "$?" in
+      1) return 0 ;; # key input aborted
+      2) : ;;        # wrong key
+      *) do_system_partitions_down ;;
+    esac
+
+  fi
+
+  if [ "$exit_status" -ne 0 ]; then
+    do_render_failure "The command '$1' failed with exit code '$exit_code'"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_render_update_manager() {
+
+  local input= packages=
+
+  local opts="-o Dpkg::Use-Pty=0 -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' --auto-remove --yes"
+
+  local vars="DEBIAN_FRONTEND=noninteractive DEBIAN_PRIORITY=critical"
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "UPDATE MANAGER"
+
+    do_render_battery_status
+    do_render_network_status
+    echo ""
+    echo " 1)  UPDATE CHROMIUM"
+    echo " 2)  UPDATE FIREFOX"
+    echo " 3)  UPDATE KERNEL"
+    echo " 4)  UPDATE PACKAGES"
+    echo ""
+    echo " 5) INSTALL PACKAGES"
+    echo " 6)  REMOVE PACKAGES"
+    echo " 7)  REPAIR PACKAGES"
+    echo ""
+    echo " 8) INSTALL DRIVERS"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    if ! ip route get 1.1.1.1 >/dev/null 2>&1; then
+      do_render_failure "You are not connected to the internet!"
+      do_press_enter_to_continue
+      continue
+    fi
+
+    if [ "$input" = "5" ] || [ "$input" = "6" ]; then
+      echo ""
+      echo -e -n " Enter a list of package names: \033[1;36m"
+      read -r packages || continue
+      echo -e -n "\033[0m"
+      [ -n "$packages" ] || continue
+    fi
+
+    case "$input" in
+      1) do_execute_chroot_command "apt-get update && $vars apt-get $opts install --only-upgrade chromium-browser                     && apt-get clean" ;;
+      2) do_execute_chroot_command "apt-get update && $vars apt-get $opts install --only-upgrade firefox                              && apt-get clean" ;;
+      3) do_execute_chroot_command "apt-get update && $vars apt-get $opts install --only-upgrade --no-install-recommends linux-image* && apt-get clean" ;;
+      4) do_execute_chroot_command "apt-get update && $vars apt-get $opts upgrade                                                     && apt-get clean" ;;
+      5) do_execute_chroot_command "apt-get update && $vars apt-get $opts install $packages                                           && apt-get clean" ;;
+      6) do_execute_chroot_command "apt-get update && $vars apt-get $opts remove  $packages                                           && apt-get clean" ;;
+      7) do_execute_chroot_command "apt-get update && $vars apt-get $opts install --fix-broken                                        && apt-get clean" ;;
+      8) do_execute_chroot_command "apt-get update && $vars apt-get $opts install firmware-linux-free firmware-misc-nonfree           && apt-get clean" ;;
+    B|b) break ;;
+    esac
+
+  done
+}
+
+do_unlock_screen() {
+
+  local input= keyslot= keytype=
+
+  do_request_key_or_passphrase || return $?
+
+  if input_is_uuencoded "$input"; then
+    keytype=KEY
+  else
+    keytype=PASSPHRASE
+  fi
+
+  do_render_action "Unlocking..."
+
+  if ! keyslot=$( do_get_key_slot "$input" ); then
+    do_render_failure "$keytype NOT FOUND"
+    do_press_enter_to_continue
+    return 1
+  fi
+}
+
+do_start_screensaver() {
+
+  do_clear_screen
+
+  cmatrix
+}
+
+do_render_lock_screen() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "SCREEN LOCKED"
+
+    do_render_battery_status
+    do_render_network_status
+    echo ""
+    echo -e " \033[1;33mThis computer is locked. You will have to\033[0m"
+    echo -e " \033[1;33menter a passphrase to unlock the computer.\033[0m"
+    echo ""
+    echo " S) SCREENSAVER"
+    echo ""
+    echo " U) UNLOCK"
+    echo " R) REBOOT"
+    echo " P) POWEROFF"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || continue
+
+    case "$input" in
+      S|s) do_start_screensaver ;;
+      U|u) do_unlock_screen && break ;;
+      R|r) do_reboot ;;
+      P|p) do_poweroff ;;
+    esac
+
+  done
+}
+
+do_render_ssh_server_menu() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "EXPERT MENU" "SSH SERVER"
+
+    do_render_battery_status
+    do_render_network_status
+    do_render_sshd_status
+    echo ""
+    echo " 1) START"
+    echo " 2) STOP"
+    echo " 3) STATUS"
+    echo ""
+    echo -e " C) CHANGE PORT [\033[1;36m$sshd_port\033[0m]"
+    echo " E) EDIT AUTHORIZED KEYS"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      1) do_sshd_start ;;
+      2) do_sshd_stop ;;
+      3) do_sshd_status ;;
+    C|c) do_sshd_change_listening_port ;;
+    E|e) do_sshd_edit_authorized_keys ;;
+    B|b) break ;;
+    esac
+
+  done
+}
+
+do_render_expert_menu() {
+
+  local input=
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "EXPERT MENU" "ONLY FOR EXPERTS"
+
+    do_render_battery_status
+    do_render_network_status
+    do_render_sshd_status
+    echo ""
+    echo " 1) FILE MANAGER"
+    echo " 2) WEB BROWSER"
+    echo " 3) SYSTEM MONITOR"
+    echo " 4) EDITOR"
+    echo " 5) SSH SERVER"
+    echo ""
+    echo " 6) SHELL"
+    echo ""
+    echo " 7) CHROOT"
+    echo " 8) CHROOT WITH SSH SERVER [PORT: 1337]"
+    echo ""
+    echo " B) BACK"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input || return 0
+
+    case "$input" in
+      1) do_mc_start ;;
+      2) do_lynx_start ;;
+      3) do_htop_start ;;
+      4) do_nano_start ;;
+      5) do_render_ssh_server_menu ;;
+      6) do_busybox_start ;;
+      7) do_chroot_start ;;
+      8) do_chroot_with_sshd_start ;;
+    B|b) break ;;
+    esac
+
+  done
+}
+
+do_ask_pass() {
+
+  [ -e /lib/cryptsetup/passfifo ] || return 0
+
+  local input= key= keytype=
+
+  do_clear_screen
+
+  do_render_header "ASK PASS"
+
+  echo -e " \033[1;33mWARNING: You are about to unlock the crypto partition:\033[0m"
+  echo ""
+  echo -e " \033[1;35m${DEV}\033[0m \033[1;37m($TARGET)\033[0m \033[1;33mon the device\033[0m \033[1;36m$( do_get_device_name $DEV )\033[0m"
+  echo ""
+  echo -e " \033[1;33mBy unlocking the partition it is possible to continue the \033[0m"
+  echo -e " \033[1;33mboot process.\033[0m"
+  echo ""
+  echo -e " \033[1;31mTHIS SCRIPT WILL BE KILLED AFTER THE PARTITION HAS BEEN UNLOCKED!\033[0m"
+  echo ""
+  echo ""
+
+  if [ -z "$KEY" ]; then
+
+    do_request_key_or_passphrase || return $?
+    key="$input"
+
+    if input_is_uuencoded "$key"; then
+      keytype=key
+    else
+      keytype=passphrase
+    fi
+
+  else
+    keytype='key file'
+    do_press_enter_to_continue || return 0
+  fi
+
+  do_render_action "Unlocking..."
+
+  if [ -b /dev/mapper/$TARGET ]; then
+    do_render_warning "Partition '$DEV' is already unlocked"
+  elif ! ( do_cat_key "${KEY:-$key}" >/lib/cryptsetup/passfifo ) 2>/dev/null; then
+    do_render_failure "I/O error while writing to /lib/cryptsetup/passfifo"
+  else
+    do_render_success "$keytype was passed to /lib/cryptsetup/passfifo"
+  fi
+
+  do_press_enter_to_continue
+}
+
+do_render_battery_status() {
+
+  local present capacity status 
+
+  if [ ! -e /sys/class/power_supply/BAT1/present ]; then
+    return 0
+  elif ! read -r present < /sys/class/power_supply/BAT1/present; then
+    return 0
+  elif [ -z "${present##*[!0-9]*}" -o $present -lt 1 ]; then
+    return 0
+  elif [ ! -e /sys/class/power_supply/BAT1/capacity ]; then
+    return 0
+  elif ! read -r capacity < /sys/class/power_supply/BAT1/capacity; then
+    return 0
+  elif [ -z "${capacity##*[!0-9]*}" -o $capacity -lt 1 ]; then
+    return 0
+  elif [ ! -e /sys/class/power_supply/BAT1/status ]; then
+    return 0
+  elif ! read -r status < /sys/class/power_supply/BAT1/status; then
+    return 0
+  fi
+
+  if [ -z "$status" ]; then
+    if [ "$capacity" -ge 100 ]; then
+      status=Full
+    else
+      status=Unknown
+    fi
+  fi
+
+  case "$status" in
+    [Ff][Uu][Ll][Ll]|[Cc][Hh][Aa][Rr][Gg][Ee][Dd]|[Cc][Hh][Aa][Rr][Gg][Ii][Nn][Gg])
+      echo -e "  BAT: \033[1;32m${status} (${capacity}%)\033[0m" ;;
+    [Uu][Nn][Kk][Nn][Oo][Ww][Nn])
+      echo -e "  BAT: \033[1;31m${status} (${capacity}%)\033[0m" ;;
+    [Dd][Ii][Ss][Cc][Hh][Aa][Rr][Gg][Ii][Nn][Gg])
+      if [ -z "${capacity##*[!0-9]*}" -o $capacity -le 15 ]; then
+        echo -e "  BAT: \033[1;31m${status} (${capacity}%)\033[0m"
+      else
+        echo -e "  BAT: \033[1;33m${status} (${capacity}%)\033[0m"
+      fi
+      ;;
+  esac
+}
+
+do_render_network_status() {
+
+  local addr state
+
+  if [ -z "$lan" ] || ! addr=$( do_get_interface_address "$lan" ) || ! state=$( do_get_interface_state "$lan" ); then
+    echo -e "  LAN: \033[1;33mOFFLINE\033[0m \033[1;36m[${lan:-N/A}]\033[0m"
+  elif [ "$state" != "up" ]; then
+    echo -e "  LAN: \033[1;33m$addr ($state)\033[0m \033[1;36m[${lan:-N/A}]\033[0m"
+  else
+    echo -e "  LAN: \033[1;32m$addr\033[0m \033[1;36m[${lan:-N/A}]\033[0m"
+  fi
+
+  if [ -z "$wlan" ] || ! addr=$( do_get_interface_address "$wlan" ) || ! state=$( do_get_interface_state "$wlan" ); then
+    echo -e " WLAN: \033[1;33mOFFLINE\033[0m \033[1;36m[${wlan:-N/A}]\033[0m"
+  elif [ "$state" != "up" ]; then
+    echo -e " WLAN: \033[1;33m$addr ($state)\033[0m \033[1;36m[${wlan:-N/A}]\033[0m"
+  else
+    echo -e " WLAN: \033[1;32m$addr\033[0m \033[1;36m[${wlan:-N/A}]\033[0m"
+  fi
+}
+
+#do_render_bat_capacity() {
+#  do_render_capacity $( do_get_bat_capacity || echo 0 )
+#}
+#
+#do_render_link_quality() { # $1 = interface
+#  do_render_capacity $( do_get_link_quality "$1" || echo 0 )
+#}
+#
+#do_render_capacity() { # $1 = capacity
+#  case "$1" in
+#    [89][0-9]|100)   echo -e "\033[1;32m_▂▄▆█\033[0m\033[1;30m\033[0m $1%" ;;
+#    [67][0-9])       echo -e "\033[1;36m_▂▄▆\033[0m\033[1;30m█\033[0m $1%" ;;
+#    [45][0-9])       echo -e "\033[1;35m_▂▄\033[0m\033[1;30m▆█\033[0m $1%" ;;
+#    [23][0-9])       echo -e "\033[1;33m_▂\033[0m\033[1;30m▄▆█\033[0m $1%" ;;
+#     [1][0-9]|[1-9]) echo -e "\033[1;31m_\033[0m\033[1;30m▂▄▆█\033[0m $1%" ;;
+#    *)               echo -e "\033[1;31m\033[0m\033[1;30m_▂▄▆█\033[0m $1%" ;;
+#  esac
+#}
+#
+#do_get_bat_capacity() {
+#  if [ ! -e /sys/class/power_supply/BAT1/capacity ]; then
+#    return 0
+#  else
+#    cat /sys/class/power_supply/BAT1/capacity
+#  fi
+#}
+#
+#do_get_link_quality() { # $1 = interface
+#  local a b c d e
+#  while IFS=":.$IFS" read -r a b c d e; do
+#    if [ "$a" = "$1" ]; then
+#      echo $(( ( d + 110 ) * 10 / 7 ))
+#      return 0
+#    fi
+#  done < /proc/net/wireless
+#  return 1
+#}
+#
+#do_render_status_bar_content() {
+#  printf 'BAT: %-40.40s | WIFI: %-40.40s | %-28.28s' "$( do_render_bat_capacity )" "$( do_render_link_quality wlan0 )" "$( date )"
+#}
+
+do_render_status_bar() {
+# echo -ne "\033[s\033[0;$((COLUMNS-64))H$(do_render_status_bar_content)\033[u" >&2
+  echo -ne "\033[s\033[0;$((COLUMNS-27))H$(date)\033[u" >&2
+}
+
+do_clear_screen() {
+  reset
+  clear
+
+# echo -ne "\033[s" >&2
+# for n in $( seq 1 24 ); do
+#   echo -ne "\033[${n};80H|" >&2
+# done
+# for n in $( seq 1 80 ); do
+#   echo -ne "\033[24;${n}H-" >&2
+# done
+# echo -ne "\033[24;80H+" >&2
+# echo -ne "\033[u" >&2
+
+  do_render_status_bar
+}
+
+do_reander_main_gui() {
+
+  local input lan wlan iter_time=2000 key_read_opts=-s sshd_port=42
+
+   lan=$( do_get_interface_by_type  lan up || do_get_interface_by_type  lan || : )
+  wlan=$( do_get_interface_by_type wlan up || do_get_interface_by_type wlan || : )
+
+  while true; do
+
+    do_clear_screen
+
+    do_render_header "ADMIN MODE"
+
+    do_render_battery_status
+    do_render_network_status
+    echo ""
+    echo " 1) NETWORK MANAGER"
+    echo " 2) UPDATE MANAGER"
+    echo " 3) CRYPTO MANAGER"
+    [ ! -e /lib/cryptsetup/passfifo ] ||
+    echo " 4) ASK PASS"
+    echo ""
+    echo " E) EXPERT MENU"
+    echo ""
+    echo " L) LOCK SCREEN"
+    echo " R) REBOOT"
+    echo " P) POWEROFF"
+    [ -z "$FORCED_START" ] ||
+    echo " Q) QUIT"
+    echo ""
+    echo -n " Choose an option: "
+    read -r input
+
+    case "$input" in
+      1) do_render_network_manager ;;
+      2) do_render_update_manager ;;
+      3) do_render_crypto_manager ;;
+      4) do_ask_pass ;;
+    E|e) do_render_expert_menu ;;
+    L|l) do_render_lock_screen ;;
+    R|r) do_reboot ;;
+    P|p) do_poweroff ;;
+    Q|q) [ -z "$FORCED_START" ] || return 0 ;;
+     42) return 0 ;;
+    esac
+
+  done
+}
+
+while true; do do_render_status_bar; sleep 0.99; done & CLOCK_PID=$!
+
+echo $CLOCK_PID >>/run/$MYTAG.pids
+
+sleep 0.5
+
+do_reander_main_gui
+
+kill -HUP $CLOCK_PID 2>/dev/null
+
+exit 0
+

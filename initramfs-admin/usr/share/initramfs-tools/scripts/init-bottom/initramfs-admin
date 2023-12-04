@@ -1,0 +1,85 @@
+#!/bin/sh
+
+# Initramfs-Admin (init-bottom script)
+# Copyright (C) 2023 m4dm4x1337
+#
+# This file is part of the initramfs-admin debian package.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+PREREQ=""
+
+prereqs() {
+  echo "$PREREQ"
+}
+
+case "$1" in
+  prereqs)
+    prereqs
+    exit 0
+    ;;
+esac
+
+# import /usr/share/initramfs-tools/scripts/functions
+. /scripts/functions
+
+# show begin msg
+log_begin_msg "Cleanup initramfs-admin"
+
+# define a tag for logging
+MYTAG=initramfs-admin
+
+# check if non-empty .pids file exists
+if ! [ -s /run/$MYTAG.pids ]; then
+  log_success_msg "the file /run/$MYTAG.pids does not exist or is empty"
+  exit 0
+fi
+
+# used to collect killable pid's
+PIDS=
+
+# check each pid in /run/$MYTAG.pids
+while read -r PID || [ -n "$PID" ]; do
+  if [ -z "$PID" ]; then
+    continue # ignore empty line
+  elif ! kill -0 $PID 2>/dev/null; then
+    continue # not running
+  elif ! read -r COMM < /proc/$PID/comm 2>/dev/null; then
+    continue # something went wrong
+  elif ! [ "$COMM" = "$MYTAG" ]; then
+    continue # other process
+  else
+    PIDS="${PIDS:+$PIDS }$PID"
+  fi
+done < /run/$MYTAG.pids
+
+# stop here if there is nothing to kill
+if [ -z "$PIDS" ]; then
+  log_success_msg "no running $MYTAG processes found"
+  exit 0
+fi
+
+# log killed processes
+for PID in $PIDS; do
+  printf ' %5.5s    %s\n' "$PID" "$( cat /proc/$PID/cmdline 2>/dev/null | tr '\0\n' ' ' )" >>/run/$MYTAG.kill
+done
+
+# log the kill command
+log_success_msg "running kill -HUP $PIDS"
+
+# kill still running processes
+kill -HUP $PIDS 2>>/run/$MYTAG.kill
+
+exit 0
+
